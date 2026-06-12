@@ -46,8 +46,8 @@ logger = logging.getLogger(__name__)
 # Constantes padrão
 # ---------------------------------------------------------------------------
 _DEFAULT_IMG_SIZE   = 640
-_DEFAULT_CONF_THRES = 0.1
-_DEFAULT_IOU_THRES  = 0.45
+_DEFAULT_CONF_THRES = 0.01
+_DEFAULT_IOU_THRES  = 0.01
 
 _DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[4] / (
     "models/live_qr_yolo/train/weights/best.onnx"
@@ -166,7 +166,7 @@ class IrisDetector:
         raw_boxes: list[tuple[int, int, int, int, float]] = []
 
         for det in output:
-            cx, cy, bw, bh, conf, _cls = det
+            cx, cy, bw, bh, conf, *_ = det
 
             if conf < self.conf_threshold:
                 continue
