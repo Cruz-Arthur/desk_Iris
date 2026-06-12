@@ -37,8 +37,8 @@ _REPEL_R       = 130    # mouse repulsion radius (px)
 _LINE_R        = 110    # constellation line radius (px)
 _DECAY         = 0.91   # velocity decay per frame back toward base
 
-_BG_TOP    = "#060A11"
-_BG_BOTTOM = "#0C1422"
+_BG_TOP    = "#0B0E13"
+_BG_BOTTOM = "#121823"
 
 
 # ── Internal particle ─────────────────────────────────────────────────────────
@@ -50,7 +50,7 @@ class _Star:
         self.x     = random.uniform(0, w)
         self.y     = random.uniform(0, h)
         self.r     = random.uniform(0.9, 2.4)
-        self.alpha = random.randint(55, 200)
+        self.alpha = random.randint(35, 140)
         self.vx    = bvx
         self.vy    = bvy
 
@@ -189,7 +189,7 @@ class StarFieldPanel(QWidget):
             dist   = math.hypot(dx, dy)
             if 0.1 < dist < _LINE_R:
                 a   = int(55 * (1 - dist / _LINE_R))
-                pen = QPen(QColor(0, 255, 136, a))
+                pen = QPen(QColor(255, 180, 84, a))
                 pen.setWidthF(0.6)
                 p.setPen(pen)
                 p.drawLine(int(mx), int(my), int(s.x), int(s.y))
@@ -205,15 +205,15 @@ class StarFieldPanel(QWidget):
                 t       = 1 - dist / _REPEL_R
                 boost_a = int(t * 120)
                 boost_r = t * 1.6
-            p.setBrush(QColor(0, 255, 136, min(255, s.alpha + boost_a)))
+            p.setBrush(QColor(255, 180, 84, min(255, s.alpha + boost_a)))
             p.drawEllipse(QPointF(s.x, s.y), s.r + boost_r, s.r + boost_r)
 
         # Accent edge line
         if self._accent:
             ag = QLinearGradient(0, 0, 0, self.height())
-            ag.setColorAt(0.0, QColor(0, 255, 136,  0))
-            ag.setColorAt(0.5, QColor(0, 255, 136, 50))
-            ag.setColorAt(1.0, QColor(0, 255, 136,  0))
+            ag.setColorAt(0.0, QColor(255, 180, 84,  0))
+            ag.setColorAt(0.5, QColor(255, 180, 84, 50))
+            ag.setColorAt(1.0, QColor(255, 180, 84,  0))
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(ag)
             e = self._accent

@@ -46,8 +46,8 @@ logger = logging.getLogger(__name__)
 # Constantes padrão
 # ---------------------------------------------------------------------------
 _DEFAULT_IMG_SIZE   = 640
-_DEFAULT_CONF_THRES = 0.01
-_DEFAULT_IOU_THRES  = 0.01
+_DEFAULT_CONF_THRES = 0.51
+_DEFAULT_IOU_THRES  = 0.45
 
 _DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[4] / (
     "models/live_qr_yolo/train/weights/best.onnx"
@@ -119,9 +119,23 @@ class IrisDetector:
         if not resolved.exists():
             raise FileNotFoundError(f"Modelo ONNX não encontrado: {resolved}")
 
-        _providers = providers or ort.get_available_providers()
+        if providers is None:
+            all_p = ort.get_available_providers()
+            _providers = (
+                ["DmlExecutionProvider", "CPUExecutionProvider"]
+                if "DmlExecutionProvider" in all_p
+                else all_p
+            )
+        else:
+            _providers = providers
 
-        self._session = ort.InferenceSession(str(resolved), providers=_providers)
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        if "DmlExecutionProvider" not in _providers:
+            opts.intra_op_num_threads = min(4, os.cpu_count() or 4)
+            opts.inter_op_num_threads = 1
+
+        self._session = ort.InferenceSession(str(resolved), sess_options=opts, providers=_providers)
         self._input_name = self._session.get_inputs()[0].name
 
         logger.info(
@@ -135,24 +149,18 @@ class IrisDetector:
     # ------------------------------------------------------------------
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
-        """Redimensiona e normaliza o frame para entrada do modelo."""
-        img = cv2.resize(frame, (self.img_size, self.img_size))
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))   # HWC → CHW
-        img = np.expand_dims(img, axis=0)     # batch dim
-        return img
+        img = cv2.resize(frame, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+        # Modelos exportados pelo Ultralytics esperam entrada RGB — alimentar
+        # BGR direto da câmera degrada a confiança silenciosamente.
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img.astype(np.float32) * (1.0 / 255.0)
+        return np.ascontiguousarray(img.transpose(2, 0, 1))[np.newaxis]
 
     def _postprocess(
         self,
         raw_output: list[np.ndarray],
         original_shape: tuple[int, int],
     ) -> list[Detection]:
-        """
-        Converte a saída crua do modelo em lista de Detection.
-
-        Formato esperado de saída do ONNX: (1, 6, 8400)
-        Colunas: [cx, cy, w, h, conf, class_id]
-        """
         h, w = original_shape
 
         output = np.squeeze(raw_output[0])
@@ -160,33 +168,33 @@ class IrisDetector:
         if output.ndim == 1:
             output = np.expand_dims(output, axis=0)
 
-        if output.ndim == 2 and output.shape[0] == 6:
-            output = output.T
+        if output.ndim == 2 and output.shape[0] < output.shape[1]:
+            output = output.T  # (8400, 4+nc)
 
-        raw_boxes: list[tuple[int, int, int, int, float]] = []
+        # class 2 = QrCode (0=BarCode, 1=Box)
+        confs = output[:, 6]
+        mask = confs >= self.conf_threshold
+        if not mask.any():
+            return []
 
-        for det in output:
-            cx, cy, bw, bh, conf, *_ = det
+        sel   = output[mask]
+        confs = confs[mask]
+        sx = w / self.img_size
+        sy = h / self.img_size
+        hw = sel[:, 2] * 0.575  # half-width com margem 15%
+        hh = sel[:, 3] * 0.575  # half-height com margem 15%
 
-            if conf < self.conf_threshold:
-                continue
+        x1 = np.clip(((sel[:, 0] - hw) * sx).astype(np.int32), 0, w)
+        y1 = np.clip(((sel[:, 1] - hh) * sy).astype(np.int32), 0, h)
+        x2 = np.clip(((sel[:, 0] + hw) * sx).astype(np.int32), 0, w)
+        y2 = np.clip(((sel[:, 1] + hh) * sy).astype(np.int32), 0, h)
 
-            # --- PONTO 1: Adicionar 10% de margem na largura e altura ---
-            bw = bw * 1.15
-            bh = bh * 1.15
-
-            x1 = int((cx - bw / 2) * w / self.img_size)
-            y1 = int((cy - bh / 2) * h / self.img_size)
-            x2 = int((cx + bw / 2) * w / self.img_size)
-            y2 = int((cy + bh / 2) * h / self.img_size)
-
-            # --- PONTO 2: Travar limites para não vazar da imagem ---
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(w, x2)
-            y2 = min(h, y2)
-
-            raw_boxes.append((x1, y1, x2, y2, float(conf)))
+        valid = (x2 > x1) & (y2 > y1)
+        raw_boxes = list(zip(
+            x1[valid].tolist(), y1[valid].tolist(),
+            x2[valid].tolist(), y2[valid].tolist(),
+            confs[valid].tolist(),
+        ))
 
         return self._apply_nms(raw_boxes)
 

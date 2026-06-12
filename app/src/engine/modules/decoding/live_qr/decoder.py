@@ -1,15 +1,17 @@
 """
 Iris - QR Decoder
 =================
-Responsabilidade unica: interpretar regioes detectadas pelo YOLO e retornar
+Responsabilidade única: interpretar regiões detectadas pelo YOLO e retornar
 os dados codificados nos QR Codes.
 
-Pipeline interno:
-    1. Recorte da regiao com padding de seguranca (filter.crop_with_padding)
-    2. Tentativa direta sem aprimoramento
-    3. Tentativas com variantes de aprimoramento (filter.enhance_for_qr)
+Pipeline de decodificação (em ordem de tentativa):
+    1. cv2.QRCodeDetectorAruco  — mais robusto para ângulo/dano
+    2. cv2.QRCodeDetector       — fallback clássico
+    3. pyzbar                   — terceira opinião
+    Cada decodificador tenta o crop original e depois cada variante
+    gerada por enhance_for_qr(), parando no primeiro sucesso.
 
-Este modulo nao detecta QR Codes nem toma decisoes sobre o modelo YOLO.
+    Fallback final: tenta decodificar o frame completo sem crop.
 """
 
 from __future__ import annotations
@@ -30,25 +32,44 @@ except Exception:
 from app.src.engine.modules.decoding.live_qr.filter import crop_with_padding, enhance_for_qr
 
 
+def _has_aruco_qr() -> bool:
+    try:
+        cv2.QRCodeDetectorAruco()
+        return True
+    except AttributeError:
+        return False
+
+
+_ARUCO_AVAILABLE = _has_aruco_qr()
+
+
 class QrDecoder:
     """
-    Decodificador de QR Codes a partir de poligonos de deteccao.
+    Decodificador de QR Codes a partir de polígonos de detecção.
 
-    Mantem apenas o cache espacial simples que ja existia para evitar
-    reprocessamento imediato de regioes estaveis.
+    Cache espacial com TTL curto: falhas são reprocessadas quase imediatamente
+    para maximizar hits em frames com variação de ângulo/luz.
     """
 
     def __init__(
         self,
         payload_validator: Optional[Callable[[str], bool]] = None,
     ) -> None:
-        self._cv2_detector = cv2.QRCodeDetector()
+        self._detector_aruco = cv2.QRCodeDetectorAruco() if _ARUCO_AVAILABLE else None
+        self._detector_cv2   = cv2.QRCodeDetector()
         self._payload_validator = payload_validator
 
         self._spatial_cache: List[Dict[str, Any]] = []
         self._CACHE_RADIUS = 60.0
-        self._SUCCESS_TTL = 3.0
-        self._FAIL_TTL = 0.5
+        self._SUCCESS_TTL  = 3.0
+        # Backoff exponencial de falhas: primeira retentativa quase imediata
+        # (captura variação de ângulo/luz), depois dobra até o teto — uma
+        # região permanentemente ilegível deixa de drenar CPU.
+        self._FAIL_BASE = 0.08   # s — espera após a 1ª falha
+        self._FAIL_MAX  = 1.0    # s — teto do backoff
+        self._FAIL_KEEP = 3.0    # s — memória da região falhada
+
+    # ── API pública ────────────────────────────────────────────────────────────
 
     def decode(
         self,
@@ -59,9 +80,8 @@ class QrDecoder:
 
         self._spatial_cache = [
             c for c in self._spatial_cache
-            if c["status"] == "PROCESSING"
-            or (c["status"] == "VALID" and now - c["ts"] < self._SUCCESS_TTL)
-            or (c["status"] == "FAILED" and now - c["ts"] < self._FAIL_TTL)
+            if (c["status"] == "VALID"  and now - c["ts"] < self._SUCCESS_TTL)
+            or (c["status"] == "FAILED" and now - c["ts"] < self._FAIL_KEEP)
         ]
 
         results: List[Tuple[Optional[str], Optional[np.ndarray], int, int]] = []
@@ -86,32 +106,47 @@ class QrDecoder:
                     results.append((entry["text"], None, 0, 0))
                     continue
 
-                if entry["status"] in ("PROCESSING", "FAILED"):
+                # FAILED — só reprocessa quando o backoff expirar
+                backoff = min(self._FAIL_BASE * (2 ** entry["fails"]), self._FAIL_MAX)
+                if now - entry["ts"] < backoff:
                     results.append((None, None, 0, 0))
                     continue
 
+                text, patch, ox, oy = self._safe_decode(frame, pts)
+                if text:
+                    entry.update(status="VALID", text=text,
+                                 ts=time.monotonic(), fails=0)
+                else:
+                    entry["fails"] += 1
+                    entry["ts"] = time.monotonic()
+                results.append((text, patch, ox, oy))
+                continue
+
+            # Região nova — primeira tentativa imediata
+            text, patch, ox, oy = self._safe_decode(frame, pts)
             new_entry: Dict[str, Any] = {
-                "cx": cx,
-                "cy": cy,
-                "text": None,
-                "status": "PROCESSING",
-                "ts": now,
+                "cx": cx, "cy": cy,
+                "text": text,
+                "status": "VALID" if text else "FAILED",
+                "ts": time.monotonic(),
+                "fails": 0,
             }
             self._spatial_cache.append(new_entry)
-
-            try:
-                text, patch, ox, oy = self._decode_region(frame, pts)
-            except Exception:
-                text, patch, ox, oy = None, None, 0, 0
-
-            if text:
-                new_entry.update(status="VALID", text=text, ts=time.monotonic())
-            else:
-                new_entry.update(status="FAILED", text=None, ts=time.monotonic())
-
             results.append((text, patch, ox, oy))
 
         return results
+
+    def _safe_decode(
+        self,
+        frame: np.ndarray,
+        pts: np.ndarray,
+    ) -> Tuple[Optional[str], Optional[np.ndarray], int, int]:
+        try:
+            return self._decode_region(frame, pts)
+        except Exception:
+            return None, None, 0, 0
+
+    # ── Pipeline de decodificação ──────────────────────────────────────────────
 
     def _decode_region(
         self,
@@ -121,30 +156,98 @@ class QrDecoder:
         x, y, w, h = cv2.boundingRect(pts.astype(np.int32))
         anchor = (x, y, w, h)
 
-        crop, ox, oy = crop_with_padding(frame, anchor, padding=12)
-        if crop.size == 0:
+        # Crop normal (padding 24) e crop generoso (padding 48) para não cortar
+        # finder patterns em detecções com bbox apertada
+        crop_norm, ox, oy = crop_with_padding(frame, anchor, padding=24)
+        crop_wide, _,  _  = crop_with_padding(frame, anchor, padding=48)
+
+        if crop_norm.size == 0:
             return None, None, ox, oy
 
-        base_bgr = crop if crop.ndim == 3 else cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
-
-        result = self._run_qreader(base_bgr)
+        # Tenta crop normal primeiro
+        result = self._try_all_decoders(crop_norm)
         if result:
-            return result, base_bgr, ox, oy
+            return result, crop_norm, ox, oy
 
-        last_bgr = base_bgr
-        for _name, variant in enhance_for_qr(crop):
-            bgr = (
-                cv2.cvtColor(variant, cv2.COLOR_GRAY2BGR)
-                if variant.ndim == 2
-                else variant
-            )
-            last_bgr = bgr
-
-            result = self._run_qreader(bgr)
+        # Tenta crop mais generoso antes de entrar no pipeline de preprocessing
+        if crop_wide.size > 0 and crop_wide.shape != crop_norm.shape:
+            result = self._try_all_decoders(crop_wide)
             if result:
-                return result, bgr, ox, oy
+                return result, crop_wide, ox, oy
 
-        return None, last_bgr, ox, oy
+        # Pipeline de preprocessamento (lazy — para no primeiro hit).
+        # As variantes em escala de cinza vão DIRETO aos decoders — todos
+        # aceitam imagens 2D; converter gray→BGR→gray seria puro desperdício.
+        last_img = crop_norm
+        for _name, variant in enhance_for_qr(crop_norm):
+            last_img = variant
+            result = self._try_all_decoders(variant)
+            if result:
+                return result, variant, ox, oy
+
+        return None, last_img, ox, oy
+
+    def _try_all_decoders(self, img: np.ndarray) -> Optional[str]:
+        """
+        Tenta todos os decoders disponíveis sobre uma mesma imagem.
+
+        A conversão para cinza acontece UMA única vez aqui — os três
+        decoders aceitam entrada 2D, então nenhum reconverte internamente.
+        """
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+
+        # 1. QRCodeDetectorAruco (mais robusto — trata perspectiva/dano)
+        if self._detector_aruco is not None:
+            result = self._run_aruco(gray)
+            if result:
+                return result
+
+        # 2. QRCodeDetector clássico
+        result = self._run_cv2(gray)
+        if result:
+            return result
+
+        # 3. pyzbar
+        result = self._run_pyzbar(gray)
+        if result:
+            return result
+
+        return None
+
+    def _run_aruco(self, gray: np.ndarray) -> Optional[str]:
+        try:
+            data, _, _ = self._detector_aruco.detectAndDecode(gray)
+            data = (data or "").strip()
+            if self._accept_text(data):
+                return data
+        except Exception:
+            pass
+        return None
+
+    def _run_cv2(self, gray: np.ndarray) -> Optional[str]:
+        try:
+            data, _, _ = self._detector_cv2.detectAndDecode(gray)
+            data = (data or "").strip()
+            if self._accept_text(data):
+                return data
+        except Exception:
+            pass
+        return None
+
+    def _run_pyzbar(self, gray: np.ndarray) -> Optional[str]:
+        if not _PYZBAR_AVAILABLE:
+            return None
+        try:
+            kwargs = {"symbols": [ZBarSymbol.QRCODE]} if ZBarSymbol is not None else {}
+            for result in _pyzbar_decode(gray, **kwargs):
+                if not result.data:
+                    continue
+                text = result.data.decode("utf-8", errors="replace").strip()
+                if self._accept_text(text):
+                    return text
+        except Exception:
+            pass
+        return None
 
     def _accept_text(self, text: Optional[str]) -> bool:
         text = (text or "").strip()
@@ -156,28 +259,3 @@ class QrDecoder:
             return bool(self._payload_validator(text))
         except Exception:
             return False
-
-    def _run_qreader(self, img: np.ndarray) -> Optional[str]:
-        try:
-            data, _, _ = self._cv2_detector.detectAndDecode(img)
-            data = (data or "").strip()
-            if self._accept_text(data):
-                return data
-        except Exception:
-            pass
-
-        if _PYZBAR_AVAILABLE:
-            try:
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
-                kwargs = {"symbols": [ZBarSymbol.QRCODE]} if ZBarSymbol is not None else {}
-                results = _pyzbar_decode(gray, **kwargs)
-                for result in results:
-                    if not result.data:
-                        continue
-                    text = result.data.decode("utf-8", errors="replace").strip()
-                    if self._accept_text(text):
-                        return text
-            except Exception:
-                pass
-
-        return None

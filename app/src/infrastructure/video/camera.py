@@ -159,14 +159,13 @@ def discover_cameras(max_index: int = 10, verify_access: bool = True) -> List[Ca
     return cameras
 
 
-def _apply_max_resolution(cap: cv2.VideoCapture) -> tuple[int, int]:
-    """
-    Requests the highest resolution in one shot and returns what the driver
-    actually accepted.  A single set+get pair avoids the 3-iteration loop
-    (up to 6 driver round-trips) that was the second-biggest startup cost.
-    """
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  _RESOLUTION_CANDIDATES[0][0])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, _RESOLUTION_CANDIDATES[0][1])
+def _apply_max_resolution(
+    cap: cv2.VideoCapture,
+    target: tuple[int, int] | None = None,
+) -> tuple[int, int]:
+    w, h = target or _RESOLUTION_CANDIDATES[0]
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
     return (
         int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
         int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
@@ -215,9 +214,9 @@ def _open_camera(
 
     # ── Full probe: DSHOW first, then MSMF, then ANY as last resort ──────────
     attempts = backend_order or [
-        ("DSHOW", cv2.CAP_DSHOW),   # ~400 ms on Windows — fastest
-        ("MSMF",  cv2.CAP_MSMF),   # ~2–4 s  on Windows — thorough
-        ("ANY",   cv2.CAP_ANY),    # platform default   — last resort
+        ("ANY",   cv2.CAP_ANY),    # deixa o OS escolher — mais rápido na maioria das máquinas
+        ("MSMF",  cv2.CAP_MSMF),   # Media Foundation — fallback Windows
+        ("DSHOW", cv2.CAP_DSHOW),  # DirectShow — lento em algumas câmeras, último recurso
     ]
 
     for name, backend_id in attempts:
@@ -258,6 +257,7 @@ class SingleCameraManager:
         force_mjpg: bool = False,
         stabilize_seconds: float = 0.0,
         warmup_frames: int = 0,
+        resolution: Optional[tuple[int, int]] = None,
     ):
         # -------------------------------------------------
         # Configuração base da câmera
@@ -268,6 +268,7 @@ class SingleCameraManager:
         self._force_mjpg = force_mjpg
         self._stabilize_seconds = stabilize_seconds
         self._warmup_frames = warmup_frames
+        self._resolution = resolution
 
         # -------------------------------------------------
         # Handle do OpenCV
@@ -402,7 +403,7 @@ class SingleCameraManager:
                 pass
 
             # ── Single-shot resolution request ────────────────────────────
-            actual_w, actual_h = _apply_max_resolution(cap)
+            actual_w, actual_h = _apply_max_resolution(cap, self._resolution)
 
             # ── Optional stabilise / warmup ───────────────────────────────
             if self._stabilize_seconds > 0 and not self._stop_event.is_set():

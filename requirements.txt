@@ -3,5 +3,5 @@ opencv-contrib-python>=4.10.0.84
 PyQt6>=6.11.0
 PyQt6-Qt6>=6.11.0
 PyQt6_sip>=13.11.1
-onnxruntime>=1.23.2
+onnxruntime-directml>=1.23.0
 pyzbar>=0.1.9

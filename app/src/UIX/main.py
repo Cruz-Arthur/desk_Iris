@@ -8,12 +8,13 @@ from PyQt6.QtWidgets import QApplication, QMainWindow, QStackedWidget
 if sys.platform == "win32":
     import ctypes
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-        "Multilaser.Iris.LiveQr.1"
+        "Iris.LiveQr.1"
     )
 
 from app.src.UIX.components.shared import GLOBAL_STYLE
 from app.src.UIX.main_menu.view import MainMenuView
 from app.src.UIX.modules.decoding.live_qr.view import LiveQrView
+from app.src.infrastructure.video.camera import SingleCameraManager
 
 APP_ICON_PATH = Path(__file__).resolve().parents[1] / "assets" / "img" / "logo.png"
 
@@ -33,6 +34,12 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self._stack)
 
         self._live_qr_view = None
+
+        # Pré-aquecer câmera imediatamente ao abrir o app — antes do usuário
+        # navegar para o módulo, maximizando o tempo disponível para o hardware
+        # inicializar. Câmera não é parada ao voltar ao menu; fica quente.
+        self._cam = SingleCameraManager(camera_index=0, force_mjpg=True)
+        self._cam.start()
 
         self._main_menu = MainMenuView(
             on_live_qr=self._go_live_qr,
@@ -56,9 +63,15 @@ class MainWindow(QMainWindow):
 
     def _create_and_open_live_qr(self):
         if not self._live_qr_view:
-            self._live_qr_view = LiveQrView(on_back=self._go_home)
+            self._live_qr_view = LiveQrView(on_back=self._go_home, camera=self._cam)
             self._stack.addWidget(self._live_qr_view)
         self._stack.setCurrentWidget(self._live_qr_view)
+
+    def closeEvent(self, event) -> None:
+        if self._cam:
+            self._cam.stop()
+            self._cam = None
+        super().closeEvent(event)
 
 
 def main():

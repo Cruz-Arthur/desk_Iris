@@ -1,13 +1,22 @@
 """
 UIX/modules/decoding/live_qr/view.py
 ======================================
-Tela de detecção em tempo real via webcam — v2 redesenhada.
+Tela de detecção em tempo real via webcam — v3 "viewfinder".
+
+Estados do instrumento (a íris conta a história, o texto confirma):
+    idle    → íris fechada, overlay em espera
+    opening → íris respirando, câmera inicializando (sem tela preta)
+    live    → íris aberta, feed com retículo de viewfinder
+
+Cor é informação: âmbar = instrumento/atenção; verde = decodificado.
+
+Teclado: S inicia/para · E edges · Ctrl+L limpa leituras.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any
 
 import cv2
 import numpy as np
@@ -24,10 +33,12 @@ from PyQt6.QtGui import (
     QColor,
     QCursor,
     QImage,
+    QKeySequence,
     QLinearGradient,
     QPainter,
     QPen,
     QPixmap,
+    QShortcut,
 )
 from PyQt6.QtWidgets import (
     QFrame,
@@ -41,27 +52,31 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.src.UIX.components.shared import C, IrisAppBar, IrisButton
+from app.src.UIX.components.shared import (
+    C, F_BODY, F_DATA, F_DISPLAY, IrisAperture, IrisAppBar, IrisButton,
+)
 from app.src.engine.modules.decoding.live_qr.decoder import QrDecoder
 from app.src.engine.modules.decoding.live_qr.detector import Detection, IrisDetector
 from app.src.infrastructure.video.camera import SingleCameraManager
+from app.src.infrastructure.video.enhance import EdgeEnhancer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constantes visuais
 # ─────────────────────────────────────────────────────────────────────────────
 
-_BOX_COLOR     = (0x4C, 0x28, 0x14)
-_BOX_HI_COLOR  = (0x4A, 0xDE, 0x74)
+# BGR — âmbar (localizado, ainda sem leitura) / verde fósforo (decodificado)
+_BOX_COLOR     = (84, 180, 255)
+_BOX_HI_COLOR  = (128, 222, 74)
+_LABEL_INK     = (19, 14, 11)        # BGR de #0B0E13
 _BOX_THICKNESS = 2
 _LABEL_FONT    = cv2.FONT_HERSHEY_SIMPLEX
 _HIST_MAX      = 50
 _RENDER_INTERVAL_MS = int((1 / 33) * 1000)  # ~30 ms
 
-# Animações
-_SCANLINE_STEP    = 0.004   # fração da altura por tick de 16 ms
-_PULSE_INTERVAL   = 700     # ms — pisca do ponto de status
-_FLASH_MS         = 380     # ms — duração do flash do card
+_SCANLINE_STEP  = 0.004   # fração da altura por tick de 16 ms
+_FLASH_MS       = 380     # ms — flash do card ao repetir leitura
+_REARM_S        = 1.0     # s — ausência mínima para contar novo "bip"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,7 +90,9 @@ class _AnalysisWorker(QThread):
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self._engine   = IrisDetector()
+        # IrisDetector é inicializado dentro de run() para não bloquear a UI
+        # (DirectML compila shaders na primeira carga — pode levar vários segundos)
+        self._engine: Optional[IrisDetector] = None
         self._decoder  = QrDecoder()
         self._running  = True
         self._mutex    = QMutex()
@@ -90,6 +107,7 @@ class _AnalysisWorker(QThread):
         self._running = False
 
     def run(self) -> None:
+        self._engine = IrisDetector()  # inicializa na thread do worker
         while self._running:
             with QMutexLocker(self._mutex):
                 frame = self._pending
@@ -98,6 +116,10 @@ class _AnalysisWorker(QThread):
                     self._busy = True
 
             if frame is None:
+                self.msleep(15)
+                continue
+
+            if self._engine is None:
                 self.msleep(15)
                 continue
 
@@ -145,7 +167,7 @@ class _AnalysisWorker(QThread):
             ]:
                 cv2.line(frame, (cx, cy), (int(cx + dx * corner), cy), color, _BOX_THICKNESS + 1)
                 cv2.line(frame, (cx, cy), (cx, int(cy + dy * corner)), color, _BOX_THICKNESS + 1)
-            label = str(raw_text) if raw_text else "Nao Lido"
+            label = str(raw_text) if raw_text else "LENDO..."
             if len(label) > 20:
                 label = label[:17] + "..."
             scale, thick = 0.45, 1
@@ -155,18 +177,18 @@ class _AnalysisWorker(QThread):
                           (int(d.x1), ty - th - 4), (int(d.x1) + tw + 8, ty + 4),
                           color, cv2.FILLED)
             cv2.putText(frame, label, (int(d.x1) + 4, ty),
-                        _LABEL_FONT, scale, (0x06, 0x0B, 0x14), thick, cv2.LINE_AA)
+                        _LABEL_FONT, scale, _LABEL_INK, thick, cv2.LINE_AA)
         return frame
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Feed com overlay de linha de varredura
+# Feed com retículo de viewfinder + linha de varredura
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _ScanlineFeed(QLabel):
+class _ViewfinderFeed(QLabel):
     """
-    QLabel da câmera com linha de varredura animada pintada via paintEvent.
-    A linha representa visualmente que o sistema está ativamente varrendo.
+    QLabel da câmera com sobreposições de instrumento óptico:
+    colchetes de retículo nos cantos + linha de varredura âmbar.
     """
 
     def __init__(self, parent=None) -> None:
@@ -195,55 +217,69 @@ class _ScanlineFeed(QLabel):
         if not self._active or self.width() <= 0 or self.height() <= 0:
             return
 
-        y = int(self._scan_pos * self.height())
-
         p = QPainter(self)
-        # Halo gradiente: 20 px acima e abaixo da linha
-        top_y  = max(0, y - 20)
-        bot_y  = min(self.height(), y + 20)
-        grad   = QLinearGradient(0, top_y, 0, bot_y)
-        grad.setColorAt(0.0, QColor(0, 255, 136, 0))
-        grad.setColorAt(0.5, QColor(0, 255, 136, 40))
-        grad.setColorAt(1.0, QColor(0, 255, 136, 0))
-        p.fillRect(QRect(0, top_y, self.width(), bot_y - top_y), grad)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Linha principal
-        pen = QPen(QColor(0, 255, 136, 80))
+        # Linha de varredura âmbar com halo
+        y = int(self._scan_pos * self.height())
+        top_y = max(0, y - 20)
+        bot_y = min(self.height(), y + 20)
+        grad  = QLinearGradient(0, top_y, 0, bot_y)
+        grad.setColorAt(0.0, QColor(255, 180, 84, 0))
+        grad.setColorAt(0.5, QColor(255, 180, 84, 34))
+        grad.setColorAt(1.0, QColor(255, 180, 84, 0))
+        p.fillRect(QRect(0, top_y, self.width(), bot_y - top_y), grad)
+        pen = QPen(QColor(255, 180, 84, 70))
         pen.setWidth(1)
         p.setPen(pen)
         p.drawLine(0, y, self.width(), y)
+
+        # Colchetes de retículo nos quatro cantos
+        pen = QPen(QColor(255, 180, 84, 120), 2.0,
+                   Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        w, h = self.width(), self.height()
+        m, L = 14, 26
+        for x, yy, dx, dy in (
+            (m, m, 1, 1), (w - m, m, -1, 1),
+            (w - m, h - m, -1, -1), (m, h - m, 1, -1),
+        ):
+            p.drawLine(x, yy, x + dx * L, yy)
+            p.drawLine(x, yy, x, yy + dy * L)
         p.end()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Badge de contagem de duplicados
+# Badge de contagem de bips
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _CountBadge(QLabel):
-    """Pílula à direita do card — aparece somente quando count > 1."""
+    """Pílula ×N à direita do card — aparece a partir da segunda leitura."""
 
     _S_NORMAL = (
         f"color: {C['primary']};"
-        f"background: rgba(0,255,136,0.12);"
-        f"border: 1px solid rgba(0,255,136,0.45);"
-        "border-radius: 8px;"
-        "font-size: 9px; font-weight: 700; letter-spacing: 1px;"
-        "padding: 0px 6px;"
+        "background: rgba(255,180,84,0.12);"
+        "border: 1px solid rgba(255,180,84,0.45);"
+        "border-radius: 9px;"
+        f"font-family: {F_DATA};"
+        "font-size: 10px; font-weight: 700;"
+        "padding: 0px 7px;"
     )
     _S_FLASH = (
         f"color: {C['bg']};"
         f"background: {C['primary']};"
         f"border: 1px solid {C['primary']};"
-        "border-radius: 8px;"
-        "font-size: 9px; font-weight: 700; letter-spacing: 1px;"
-        "padding: 0px 6px;"
+        "border-radius: 9px;"
+        f"font-family: {F_DATA};"
+        "font-size: 10px; font-weight: 700;"
+        "padding: 0px 7px;"
     )
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setFixedHeight(18)
-        self.setMinimumWidth(36)
+        self.setFixedHeight(19)
+        self.setMinimumWidth(38)
         self.setStyleSheet(self._S_NORMAL)
         self.hide()
 
@@ -259,7 +295,7 @@ class _CountBadge(QLabel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Card de histórico redesenhado
+# Card do registro de leituras
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _HistoryCard(QFrame):
@@ -275,6 +311,7 @@ class _HistoryCard(QFrame):
     def __init__(self, index: int, text_value: str, parent=None) -> None:
         super().__init__(parent)
         self.setObjectName("HistCard")
+        self.text_value = str(text_value)
         self._count = 1
         self.setStyleSheet(self._S_NORMAL)
         self.setFixedHeight(38)
@@ -283,11 +320,11 @@ class _HistoryCard(QFrame):
         lay.setContentsMargins(10, 0, 8, 0)
         lay.setSpacing(8)
 
-        idx = QLabel(f"#{index:03d}")
-        idx.setFixedWidth(36)
+        idx = QLabel(f"{index:03d}")
+        idx.setFixedWidth(32)
         idx.setStyleSheet(
-            f"color:{C['primary']}; font-size:9px; font-weight:700;"
-            " letter-spacing:1px; background:transparent;"
+            f"color:{C['text_muted']}; font-family:{F_DATA};"
+            "font-size:9px; font-weight:700; background:transparent;"
         )
         lay.addWidget(idx)
 
@@ -298,12 +335,12 @@ class _HistoryCard(QFrame):
         sep.setStyleSheet(f"background:{C['border_hi']}; border:none;")
         lay.addWidget(sep)
 
-        text_str = str(text_value)
-        display  = text_str[:32] + "…" if len(text_str) > 32 else text_str
-        val      = QLabel(display)
+        display = self.text_value[:30] + "…" if len(self.text_value) > 30 else self.text_value
+        val = QLabel(display)
+        val.setToolTip(self.text_value)
         val.setStyleSheet(
-            f"color:{C['text']}; font-size:10px;"
-            " letter-spacing:0.3px; background:transparent;"
+            f"color:{C['text']}; font-family:{F_DATA}; font-size:10px;"
+            " background:transparent;"
         )
         lay.addWidget(val, stretch=1)
 
@@ -326,13 +363,13 @@ class _HistoryCard(QFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Painel lateral redesenhado
+# Painel lateral — registro de leituras
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _SidePanel(QFrame):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setFixedWidth(280)
+        self.setFixedWidth(290)
         self.setObjectName("SidePanel")
         self.setStyleSheet(f"""
             #SidePanel {{
@@ -356,17 +393,14 @@ class _SidePanel(QFrame):
             }}
         """)
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(12, 0, 12, 0)
+        hl.setContentsMargins(14, 0, 14, 0)
         hl.setSpacing(8)
 
-        icon = QLabel("◈")
-        icon.setStyleSheet(f"color:{C['primary']}; font-size:14px; background:transparent;")
-        hl.addWidget(icon)
-
-        title = QLabel("SCAN LOG")
+        title = QLabel("LEITURAS")
         title.setStyleSheet(
-            f"color:{C['primary']}; font-size:10px; font-weight:700;"
-            " letter-spacing:3px; background:transparent;"
+            f"color:{C['primary']}; font-family:{F_DISPLAY};"
+            "font-size:11px; font-weight:700; letter-spacing:4px;"
+            " background:transparent;"
         )
         hl.addWidget(title, stretch=1)
 
@@ -375,10 +409,11 @@ class _SidePanel(QFrame):
         hl.addWidget(self._hb)
 
         self._count_lbl = QLabel("0")
-        self._count_lbl.setFixedWidth(28)
+        self._count_lbl.setFixedWidth(36)
         self._count_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         self._count_lbl.setStyleSheet(
-            f"color:{C['text_muted']}; font-size:10px; letter-spacing:1px; background:transparent;"
+            f"color:{C['text']}; font-family:{F_DATA};"
+            "font-size:11px; font-weight:700; background:transparent;"
         )
         hl.addWidget(self._count_lbl)
         root.addWidget(header)
@@ -386,17 +421,17 @@ class _SidePanel(QFrame):
         # ── Stats ────────────────────────────────────────────────────────────
         stats = QFrame()
         stats.setObjectName("SPS")
-        stats.setFixedHeight(56)
+        stats.setFixedHeight(58)
         stats.setStyleSheet(
             f"#SPS {{ background:{C['surface']}; border-bottom:1px solid {C['border']}; }}"
         )
         sl = QHBoxLayout(stats)
         sl.setContentsMargins(0, 0, 0, 0)
         sl.setSpacing(0)
-        self._stat_detected = self._make_stat("LOCALIZADOS", "0", C["secondary"])
-        self._stat_reads    = self._make_stat("LIDOS",       "0", C["success"])
-        self._stat_fps      = self._make_stat("FPS",         "—", C["text_muted"])
-        for i, w in enumerate([self._stat_detected, self._stat_reads, self._stat_fps]):
+        self._stat_reads = self._make_stat("LEITURAS", "0", C["success"])
+        self._stat_scene = self._make_stat("NA CENA",  "0", C["secondary"])
+        self._stat_fps   = self._make_stat("FPS",      "—", C["text_muted"])
+        for i, w in enumerate([self._stat_reads, self._stat_scene, self._stat_fps]):
             sl.addWidget(w, stretch=1)
             if i < 2:
                 div = QFrame()
@@ -405,7 +440,7 @@ class _SidePanel(QFrame):
                 sl.addWidget(div)
         root.addWidget(stats)
 
-        # ── Scroll ────────────────────────────────────────────────────────────
+        # ── Scroll do registro ────────────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -415,37 +450,56 @@ class _SidePanel(QFrame):
         self._hist_layout = QVBoxLayout(self._hist_container)
         self._hist_layout.setContentsMargins(8, 8, 8, 8)
         self._hist_layout.setSpacing(4)
+
+        # Estado vazio: convite à ação, não decoração
+        self._empty_lbl = QLabel(
+            "Nenhuma leitura ainda.\nAproxime um código QR da câmera."
+        )
+        self._empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_lbl.setWordWrap(True)
+        self._empty_lbl.setStyleSheet(
+            f"color:{C['text_muted']}; font-family:{F_BODY};"
+            "font-size:11px; padding: 22px 10px; background:transparent;"
+        )
+        self._hist_layout.addWidget(self._empty_lbl)
         self._hist_layout.addStretch()
         scroll.setWidget(self._hist_container)
         root.addWidget(scroll, stretch=1)
 
         # ── Footer ────────────────────────────────────────────────────────────
-        clear_btn = QPushButton("⌫  LIMPAR HISTÓRICO")
-        clear_btn.setFixedHeight(32)
+        clear_btn = QPushButton("⌫  LIMPAR LEITURAS")
+        clear_btn.setFixedHeight(34)
         clear_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        clear_btn.setToolTip("Limpar registro de leituras (Ctrl+L)")
         clear_btn.setStyleSheet(f"""
             QPushButton {{
                 background: transparent; border: none;
                 border-top: 1px solid {C['border']};
                 color: {C['text_muted']};
-                font-family: 'Consolas', monospace; font-size: 9px;
+                font-family: {F_DISPLAY}; font-size: 10px;
                 font-weight: 600; letter-spacing: 2px;
             }}
             QPushButton:hover {{
                 color: {C['danger']};
-                background: rgba(248, 113, 113, 0.06);
+                background: rgba(255, 122, 122, 0.06);
+            }}
+            QPushButton:focus {{
+                color: {C['danger']};
+                border-top: 1px solid {C['danger']};
             }}
             QPushButton:pressed {{
                 color: {C['danger']};
-                background: rgba(248, 113, 113, 0.12);
+                background: rgba(255, 122, 122, 0.12);
             }}
         """)
-        clear_btn.clicked.connect(self._clear_history)
+        clear_btn.clicked.connect(self.clear_history)
         root.addWidget(clear_btn)
 
-        self._history_count = 0
-        # text → (timestamp, card)  —  rastreia duplicados dentro de 2 s
-        self._recent_texts: Dict[str, Tuple[float, _HistoryCard]] = {}
+        self._history_count = 0       # total de bips (inclui repetições)
+        # text → {"card": _HistoryCard, "last_ts": float}
+        # Um novo "bip" do mesmo código só conta após _REARM_S de ausência —
+        # presença contínua no frame NÃO infla o contador.
+        self._seen: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _make_stat(label: str, value: str, color: str) -> QWidget:
@@ -459,12 +513,14 @@ class _SidePanel(QFrame):
         val.setAlignment(Qt.AlignmentFlag.AlignCenter)
         val.setObjectName("val")
         val.setStyleSheet(
-            f"color:{color}; font-size:16px; font-weight:700; background:transparent;"
+            f"color:{color}; font-family:{F_DATA};"
+            "font-size:16px; font-weight:700; background:transparent;"
         )
         lbl = QLabel(label)
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl.setStyleSheet(
-            f"color:{C['text_muted']}; font-size:7px; letter-spacing:1.5px; background:transparent;"
+            f"color:{C['text_muted']}; font-family:{F_DISPLAY};"
+            "font-size:9px; letter-spacing:1.5px; background:transparent;"
         )
         vl.addWidget(val)
         vl.addWidget(lbl)
@@ -473,39 +529,46 @@ class _SidePanel(QFrame):
     def _get_stat_val(self, w: QWidget) -> QLabel:
         return w.findChild(QLabel, "val")
 
-    def update_stats(self, detected: int, read_count: int, fps: float) -> None:
-        self._get_stat_val(self._stat_detected).setText(str(detected))
-        self._get_stat_val(self._stat_reads).setText(str(read_count))
+    def update_stats(self, in_scene: int, fps: float) -> None:
+        self._get_stat_val(self._stat_scene).setText(str(in_scene))
         self._get_stat_val(self._stat_fps).setText(f"{fps:.1f}")
 
     def add_detection(self, text_value: str) -> None:
         now      = time.monotonic()
         text_str = str(text_value)
 
-        # Expirar entradas com mais de 2 s
-        self._recent_texts = {
-            k: v for k, v in self._recent_texts.items() if now - v[0] < 2.0
-        }
-
-        if text_str in self._recent_texts:
-            # Duplicado: atualiza timestamp e incrementa badge
-            ts, card = self._recent_texts[text_str]
-            self._recent_texts[text_str] = (now, card)
-            card.increment()
-            self._heartbeat()
+        entry = self._seen.get(text_str)
+        if entry is not None:
+            gap = now - entry["last_ts"]
+            entry["last_ts"] = now
+            if gap >= _REARM_S:
+                # Código saiu de cena e voltou: novo bip → contador ×N
+                self._history_count += 1
+                self._sync_counters()
+                entry["card"].increment()
+                self._heartbeat()
             return
 
-        # Nova leitura
+        # Primeira leitura deste código
         self._history_count += 1
-        self._count_lbl.setText(str(self._history_count))
         card = _HistoryCard(self._history_count, text_str)
-        self._recent_texts[text_str] = (now, card)
-        self._hist_layout.insertWidget(self._hist_layout.count() - 1, card)
-        if self._hist_layout.count() - 1 > _HIST_MAX:
-            item = self._hist_layout.takeAt(0)
-            if item and item.widget():
-                item.widget().deleteLater()
+        self._seen[text_str] = {"card": card, "last_ts": now}
+        self._empty_lbl.hide()
+        self._hist_layout.insertWidget(1, card)   # 0 = empty_lbl
+        self._sync_counters()
+
+        # Evita crescimento sem limite: derruba o card mais antigo
+        if self._hist_layout.count() - 2 > _HIST_MAX:   # − empty − stretch
+            item = self._hist_layout.takeAt(self._hist_layout.count() - 2)
+            w = item.widget() if item else None
+            if w is not None:
+                self._seen.pop(getattr(w, "text_value", ""), None)
+                w.deleteLater()
         self._heartbeat()
+
+    def _sync_counters(self) -> None:
+        self._count_lbl.setText(str(self._history_count))
+        self._get_stat_val(self._stat_reads).setText(str(self._history_count))
 
     def _heartbeat(self) -> None:
         """Pulsa o indicador ● no header por 200 ms a cada leitura."""
@@ -522,14 +585,16 @@ class _SidePanel(QFrame):
         except RuntimeError:
             pass
 
-    def _clear_history(self) -> None:
-        while self._hist_layout.count() > 1:
-            item = self._hist_layout.takeAt(0)
+    def clear_history(self) -> None:
+        # Mantém empty_lbl (índice 0) e o stretch final
+        while self._hist_layout.count() > 2:
+            item = self._hist_layout.takeAt(1)
             if item and item.widget():
                 item.widget().deleteLater()
         self._history_count = 0
-        self._count_lbl.setText("0")
-        self._recent_texts.clear()
+        self._seen.clear()
+        self._sync_counters()
+        self._empty_lbl.show()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -541,9 +606,16 @@ class LiveQrView(QWidget):
 
     _frame_signal = pyqtSignal(object, object)
 
-    def __init__(self, on_back=None, parent=None) -> None:
+    _STATE_TEXT = {
+        "idle":    "EM ESPERA",
+        "opening": "ABRINDO CÂMERA",
+        "live":    "AO VIVO",
+    }
+
+    def __init__(self, on_back=None, camera=None, parent=None) -> None:
         super().__init__(parent)
         self._on_back = on_back
+        self._state   = "idle"
 
         self.last_annotated: Optional[np.ndarray] = None
         self.last_results: List[Dict[str, Any]]   = []
@@ -553,23 +625,32 @@ class LiveQrView(QWidget):
         self._fps_smooth = 0.0
 
         self._worker: Optional[_AnalysisWorker]      = None
-        self._cam:    Optional[SingleCameraManager]  = None
 
         self._ui_frame_mutex  = QMutex()
         self._latest_ui_frame: Optional[np.ndarray] = None
+
+        self._edge_enhancer  = EdgeEnhancer()
+        self._edges_enabled  = False
+
+        # Câmera pré-aquecida pelo MainWindow (passada via `camera`).
+        # Se não recebida, cria uma própria (fallback para uso standalone).
+        self._cam_owned = camera is None
+        if camera is not None:
+            self._cam = camera
+        else:
+            self._cam = SingleCameraManager(camera_index=0, force_mjpg=True)
+            self._cam.start()
+
+        self._cam_subscribed = False  # rastreia subscrição, não se a câmera roda
 
         # Timer de renderização da UI
         self._render_timer = QTimer(self)
         self._render_timer.timeout.connect(self._pull_and_render)
 
-        # Timer de pulso do ponto de status
-        self._pulse_timer = QTimer(self)
-        self._pulse_timer.setInterval(_PULSE_INTERVAL)
-        self._pulse_timer.timeout.connect(self._toggle_pulse)
-        self._pulse_state = False
-
         self._frame_signal.connect(self._on_analysis_done)
         self._build()
+        self._build_shortcuts()
+        self._set_state("idle")
 
     # ── Construção da UI ──────────────────────────────────────────────────────
 
@@ -579,7 +660,7 @@ class LiveQrView(QWidget):
         root.setSpacing(0)
 
         root.addWidget(
-            IrisAppBar("Live QR Detector", show_back_button=True, on_back=self._handle_back)
+            IrisAppBar("Live QR", show_back_button=True, on_back=self._handle_back)
         )
 
         body = QHBoxLayout()
@@ -594,45 +675,60 @@ class LiveQrView(QWidget):
         fw.setContentsMargins(0, 0, 0, 0)
         fw.setSpacing(0)
 
-        # Barra de controle
-        ctrl_bar = QFrame()
-        ctrl_bar.setObjectName("CtrlBar")
-        ctrl_bar.setFixedHeight(42)
-        ctrl_bar.setStyleSheet(f"""
-            #CtrlBar {{
+        # HUD — o estado do instrumento mora aqui
+        hud = QFrame()
+        hud.setObjectName("Hud")
+        hud.setFixedHeight(46)
+        hud.setStyleSheet(f"""
+            #Hud {{
                 background: {C['surface']};
                 border-bottom: 1px solid {C['border']};
             }}
         """)
-        cl = QHBoxLayout(ctrl_bar)
+        cl = QHBoxLayout(hud)
         cl.setContentsMargins(14, 0, 12, 0)
-        cl.setSpacing(10)
+        cl.setSpacing(12)
 
-        self._status_dot = QLabel("●")
-        self._status_dot.setFixedWidth(14)
-        self._status_dot.setStyleSheet(
-            f"color:{C['text_muted']}; background:transparent; font-size:10px;"
-        )
-        cl.addWidget(self._status_dot)
+        # Íris em miniatura: fechada/respirando/aberta = idle/opening/live
+        self._hud_iris = IrisAperture(diameter=24, openness=0.10)
+        cl.addWidget(self._hud_iris)
 
-        self._status_lbl = QLabel("CÂMERA INATIVA")
+        self._status_lbl = QLabel(self._STATE_TEXT["idle"])
         self._status_lbl.setStyleSheet(
-            f"color:{C['text_muted']}; font-size:9px;"
-            " font-weight:600; letter-spacing:2px; background:transparent;"
+            f"color:{C['text_muted']}; font-family:{F_DISPLAY}; font-size:10px;"
+            " font-weight:700; letter-spacing:3px; background:transparent;"
         )
         cl.addWidget(self._status_lbl)
+
+        self._res_lbl = QLabel("")
+        self._res_lbl.setStyleSheet(
+            f"color:{C['text_muted']}; font-family:{F_DATA}; font-size:10px;"
+            " background:transparent;"
+        )
+        cl.addWidget(self._res_lbl)
         cl.addStretch()
 
-        self._toggle_btn = IrisButton("▶  INICIAR", on_click=self._toggle_capture, width=130)
-        cl.addWidget(self._toggle_btn)
-        fw.addWidget(ctrl_bar)
+        self._edges_active = False
+        self._edges_btn = QPushButton("◇  EDGES")
+        self._edges_btn.setFixedHeight(26)
+        self._edges_btn.setMinimumWidth(84)
+        self._edges_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self._edges_btn.setToolTip("Realce de bordas — CLAHE (E)")
+        self._edges_btn.clicked.connect(self._toggle_edges)
+        self._apply_edges_style()
+        cl.addWidget(self._edges_btn)
 
-        # Feed da câmera
+        self._toggle_btn = IrisButton("▶  INICIAR", on_click=self._toggle_capture, width=130)
+        self._toggle_btn.setToolTip("Iniciar/parar leitura (S)")
+        cl.addWidget(self._toggle_btn)
+        fw.addWidget(hud)
+
+        # Feed da câmera × overlay de espera
         container = QWidget()
         container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._view_stack   = QStackedLayout(container)
         self._idle_overlay = self._build_idle_overlay()
-        self._feed_label   = _ScanlineFeed()
+        self._feed_label   = _ViewfinderFeed()
         self._feed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._feed_label.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
@@ -648,105 +744,132 @@ class LiveQrView(QWidget):
         body.addWidget(self._side_panel)
 
         root.addLayout(body, stretch=1)
-        root.addWidget(self._build_statusbar())
 
     def _build_idle_overlay(self) -> QWidget:
         w = QWidget()
         w.setStyleSheet(f"background:{C['bg']};")
         vl = QVBoxLayout(w)
         vl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        vl.setSpacing(16)
+        vl.setSpacing(18)
 
-        self._idle_icon = QLabel("⊕")
-        self._idle_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._idle_icon.setStyleSheet(
-            f"color:{C['border_hi']}; font-size:60px; background:transparent;"
+        self._overlay_iris = IrisAperture(diameter=150, openness=0.10)
+        vl.addWidget(self._overlay_iris, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        self._overlay_title = QLabel("INSTRUMENTO EM ESPERA")
+        self._overlay_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._overlay_title.setStyleSheet(
+            f"color:{C['text_muted']}; font-family:{F_DISPLAY}; font-size:12px;"
+            " font-weight:700; letter-spacing:5px; background:transparent;"
         )
-        vl.addWidget(self._idle_icon)
+        vl.addWidget(self._overlay_title)
 
-        line1 = QLabel("CÂMERA AGUARDANDO")
-        line1.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        line1.setStyleSheet(
-            f"color:{C['text_muted']}; font-size:11px;"
-            " font-weight:700; letter-spacing:4px; background:transparent;"
+        self._overlay_sub = QLabel("Pressione INICIAR ou tecle S")
+        self._overlay_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._overlay_sub.setStyleSheet(
+            f"color:{C['border_hi']}; font-family:{F_BODY}; font-size:11px;"
+            " background:transparent;"
         )
-        vl.addWidget(line1)
-
-        line2 = QLabel("Pressione INICIAR para ativar")
-        line2.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        line2.setStyleSheet(
-            f"color:{C['border_hi']}; font-size:10px;"
-            " letter-spacing:2px; background:transparent;"
-        )
-        vl.addWidget(line2)
-
-        # Timer de pulso do ícone idle
-        self._idle_timer = QTimer(self)
-        self._idle_timer.setInterval(1200)
-        self._idle_timer.timeout.connect(self._toggle_idle)
-        self._idle_state = False
+        vl.addWidget(self._overlay_sub)
         return w
 
-    def _toggle_idle(self) -> None:
-        self._idle_state = not self._idle_state
-        color = C["primary_dim"] if self._idle_state else C["border_hi"]
+    def _build_shortcuts(self) -> None:
+        sc_toggle = QShortcut(QKeySequence("S"), self)
+        sc_toggle.activated.connect(self._toggle_capture)
+        sc_edges = QShortcut(QKeySequence("E"), self)
+        sc_edges.activated.connect(self._toggle_edges)
+        sc_clear = QShortcut(QKeySequence("Ctrl+L"), self)
+        sc_clear.activated.connect(self._side_panel.clear_history)
+
+    # ── Máquina de estados visual ─────────────────────────────────────────────
+
+    def _set_state(self, state: str) -> None:
+        """idle | opening | live — íris, overlay, HUD e botão em uníssono."""
+        self._state = state
         try:
-            self._idle_icon.setStyleSheet(
-                f"color:{color}; font-size:60px; background:transparent;"
-            )
-        except RuntimeError:
-            pass
+            self._status_lbl.setText(self._STATE_TEXT[state])
 
-    @staticmethod
-    def _build_statusbar() -> QFrame:
-        bar = QFrame()
-        bar.setObjectName("StatusBar")
-        bar.setFixedHeight(30)
-        bar.setStyleSheet(f"""
-            #StatusBar {{
-                background: {C['surface']};
-                border-top: 1px solid {C['border']};
-            }}
-        """)
-        bl = QHBoxLayout(bar)
-        bl.setContentsMargins(20, 0, 20, 0)
-        bl.setSpacing(20)
-        bl.addStretch()
-        for hex_color, label in [("#14284C", "LOCALIZADO"), ("#4ADE80", "DECODIFICADO")]:
-            dot = QLabel("■")
-            dot.setStyleSheet(f"color:{hex_color}; font-size:10px; background:transparent;")
-            txt = QLabel(label)
-            txt.setStyleSheet(
-                f"color:{C['text_muted']}; font-size:9px;"
-                " letter-spacing:1px; background:transparent;"
-            )
-            bl.addWidget(dot)
-            bl.addWidget(txt)
-        bl.addStretch()
-        return bar
+            if state == "idle":
+                color = C["text_muted"]
+                self._toggle_btn.setText("▶  INICIAR")
+                self._res_lbl.setText("")
+                self._hud_iris.stop_breathing()
+                self._hud_iris.animate_to(0.10, ms=400)
+                self._overlay_iris.stop_breathing()
+                self._overlay_iris.animate_to(0.10, ms=500)
+                self._overlay_title.setText("INSTRUMENTO EM ESPERA")
+                self._overlay_sub.setText("Pressione INICIAR ou tecle S")
+                self._view_stack.setCurrentIndex(0)
 
-    # ── Animações de status ───────────────────────────────────────────────────
+            elif state == "opening":
+                color = C["primary"]
+                self._toggle_btn.setText("■  PARAR")
+                self._hud_iris.start_breathing(lo=0.15, hi=0.70)
+                self._overlay_iris.start_breathing(lo=0.15, hi=0.70)
+                self._overlay_title.setText("ABRINDO CÂMERA")
+                self._overlay_sub.setText("Aguardando o primeiro frame…")
+                self._view_stack.setCurrentIndex(0)
 
-    def _toggle_pulse(self) -> None:
-        self._pulse_state = not self._pulse_state
-        color = C["primary"] if self._pulse_state else C["primary_dim"]
-        try:
-            self._status_dot.setStyleSheet(
-                f"color:{color}; background:transparent; font-size:10px;"
+            else:  # live
+                color = C["primary"]
+                self._toggle_btn.setText("■  PARAR")
+                self._hud_iris.stop_breathing()
+                self._hud_iris.animate_to(0.82, ms=450)
+                self._overlay_iris.stop_breathing()
+                self._view_stack.setCurrentIndex(1)
+                res = self._cam.resolution if self._cam else None
+                if res:
+                    self._res_lbl.setText(f"{res[0]}×{res[1]}")
+
+            self._status_lbl.setStyleSheet(
+                f"color:{color}; font-family:{F_DISPLAY}; font-size:10px;"
+                " font-weight:700; letter-spacing:3px; background:transparent;"
             )
         except RuntimeError:
             pass
 
     # ── Controle de captura ───────────────────────────────────────────────────
 
+    def _toggle_edges(self) -> None:
+        self._edges_active = not self._edges_active
+        self._edges_enabled = self._edges_active
+        self._apply_edges_style()
+
+    def _apply_edges_style(self) -> None:
+        if self._edges_active:
+            self._edges_btn.setText("◈  EDGES")
+            self._edges_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: {C['primary']};
+                    border: none; border-radius: 13px; color: {C['bg']};
+                    font-family: {F_DISPLAY};
+                    font-size: 10px; font-weight: 800; letter-spacing: 2px; padding: 0 12px;
+                }}
+                QPushButton:hover   {{ background: {C['primary_dim']}; }}
+                QPushButton:focus   {{ border: 2px solid {C['text']}; }}
+                QPushButton:pressed {{ background: {C['primary_dim']}; }}
+            """)
+        else:
+            self._edges_btn.setText("◇  EDGES")
+            self._edges_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; border: 1px solid {C['text_muted']};
+                    border-radius: 13px; color: {C['text_muted']};
+                    font-family: {F_DISPLAY};
+                    font-size: 10px; font-weight: 600; letter-spacing: 2px; padding: 0 12px;
+                }}
+                QPushButton:hover   {{ border-color:{C['text']}; color:{C['text']}; }}
+                QPushButton:focus   {{ border: 2px solid {C['primary']}; color:{C['primary']}; }}
+                QPushButton:pressed {{ border-color:{C['primary']}; color:{C['primary']}; }}
+            """)
+
     def _toggle_capture(self) -> None:
-        if self._cam and self._cam.is_running:
+        if self._cam_subscribed:
             self._stop_capture()
         else:
             self._start_capture()
 
     def _start_capture(self) -> None:
-        if self._cam and self._cam.is_running:
+        if self._cam_subscribed:
             return
 
         if self._worker is None or not self._worker.isRunning():
@@ -754,54 +877,33 @@ class LiveQrView(QWidget):
             self._worker.frame_ready.connect(self._on_worker_frame)
             self._worker.start()
 
-        try:
-            self._cam = SingleCameraManager(camera_index=0)
-            self._cam.start()
-            self._cam.subscribe(self._on_raw_frame)
-        except RuntimeError as exc:
-            self._on_error(str(exc))
-            return
+        self._cam.subscribe(self._on_raw_frame)
+        self._cam_subscribed = True
 
-        self._toggle_btn.setText("■  PARAR")
-        self._status_dot.setStyleSheet(
-            f"color:{C['primary']}; background:transparent; font-size:10px;"
-        )
-        self._status_lbl.setText("CÂMERA ATIVA")
-        self._status_lbl.setStyleSheet(
-            f"color:{C['primary']}; font-size:9px;"
-            " font-weight:600; letter-spacing:2px; background:transparent;"
-        )
-        self._view_stack.setCurrentIndex(1)
+        # O feed só aparece quando o primeiro frame chegar (_pull_and_render);
+        # até lá o overlay "ABRINDO CÂMERA" conta a verdade — sem tela preta.
+        self._set_state("opening")
         self._last_ts = time.monotonic()
         self._render_timer.start(_RENDER_INTERVAL_MS)
-        self._pulse_timer.start()
-        self._idle_timer.stop()
         self._feed_label.start_scan()
 
     def _stop_capture(self) -> None:
         self._render_timer.stop()
-        self._pulse_timer.stop()
         self._feed_label.stop_scan()
 
         if self._cam:
-            self._cam.stop()
-            self._cam = None
-
-        self._toggle_btn.setText("▶  INICIAR")
-        self._status_dot.setStyleSheet(
-            f"color:{C['text_muted']}; background:transparent; font-size:10px;"
-        )
-        self._status_lbl.setText("CÂMERA INATIVA")
-        self._status_lbl.setStyleSheet(
-            f"color:{C['text_muted']}; font-size:9px;"
-            " font-weight:600; letter-spacing:2px; background:transparent;"
-        )
-        self._view_stack.setCurrentIndex(0)
-        self._idle_timer.start()
+            self._cam.unsubscribe(self._on_raw_frame)
+            if self._cam_owned:
+                self._cam.stop()
+                self._cam = None
+        self._cam_subscribed = False
+        self._set_state("idle")
 
     # ── Callbacks de câmera ───────────────────────────────────────────────────
 
     def _on_raw_frame(self, frame: np.ndarray) -> None:
+        if self._edges_enabled:
+            frame = self._edge_enhancer.apply(frame)
         worker = self._worker
         if worker is not None and worker.isRunning():
             worker.submit_frame(frame)
@@ -814,6 +916,9 @@ class LiveQrView(QWidget):
             self._latest_ui_frame = None
         if frame is None:
             return
+        if self._state == "opening":
+            # Primeiro frame chegou — o instrumento abre
+            self._set_state("live")
         display = frame
         if self.last_results:
             display = _AnalysisWorker._annotate(display, self.last_results)
@@ -837,9 +942,7 @@ class LiveQrView(QWidget):
         self._last_ts   = now
         self.last_results = results or []
 
-        detected   = len(results)
-        read_count = sum(1 for r in results if r["text"])
-        self._side_panel.update_stats(detected, read_count, self._fps_smooth)
+        self._side_panel.update_stats(len(results), self._fps_smooth)
         for r in results:
             if r["text"]:
                 self._side_panel.add_detection(r["text"])
@@ -867,8 +970,8 @@ class LiveQrView(QWidget):
         self._stop_capture()
         self._status_lbl.setText(f"ERRO: {msg}")
         self._status_lbl.setStyleSheet(
-            f"color:{C['danger']}; font-size:9px;"
-            " font-weight:600; letter-spacing:2px; background:transparent;"
+            f"color:{C['danger']}; font-family:{F_DISPLAY}; font-size:10px;"
+            " font-weight:700; letter-spacing:3px; background:transparent;"
         )
 
     # ── Ciclo de vida do widget ───────────────────────────────────────────────
@@ -888,18 +991,19 @@ class LiveQrView(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        self._idle_timer.start()
+        # Auto-inicia: o operador não deveria precisar clicar para trabalhar.
         QTimer.singleShot(300, self._start_capture)
 
     def _release_resources(self) -> None:
         self._render_timer.stop()
-        self._pulse_timer.stop()
-        self._idle_timer.stop()
         self._feed_label.stop_scan()
 
         if self._cam:
-            self._cam.stop()
-            self._cam = None
+            self._cam.unsubscribe(self._on_raw_frame)
+            if self._cam_owned:
+                self._cam.stop()
+                self._cam = None
+        self._cam_subscribed = False
 
         if self._worker:
             self._worker.stop()
@@ -911,13 +1015,4 @@ class LiveQrView(QWidget):
 
         self.last_annotated = None
         self.last_results   = []
-        self._view_stack.setCurrentIndex(0)
-        self._toggle_btn.setText("▶  INICIAR")
-        self._status_dot.setStyleSheet(
-            f"color:{C['text_muted']}; background:transparent; font-size:10px;"
-        )
-        self._status_lbl.setText("CÂMERA INATIVA")
-        self._status_lbl.setStyleSheet(
-            f"color:{C['text_muted']}; font-size:9px;"
-            " font-weight:600; letter-spacing:2px; background:transparent;"
-        )
+        self._set_state("idle")
