@@ -462,6 +462,7 @@ class LiveQrView(QWidget):
         fw.addWidget(ctrl_bar)
 
         container = QWidget()
+        container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._view_stack = QStackedLayout(container)
         self._idle_overlay = self._build_idle_overlay()
         self._feed_label   = QLabel()
@@ -647,13 +648,13 @@ class LiveQrView(QWidget):
     def _render_frame(self, frame: np.ndarray) -> None:
         if frame is None:
             return
-        if self._feed_label.width() < 10 or self._feed_label.height() < 10:
+        if self._feed_label.width() <= 0 or self._feed_label.height() <= 0:
             return
 
         rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w = rgb.shape[:2]
 
-        qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888).copy()
+        qimg = QImage(rgb.tobytes(), w, h, 3 * w, QImage.Format.Format_RGB888).copy()
 
         pixmap = QPixmap.fromImage(qimg).scaled(
             self._feed_label.size(),
