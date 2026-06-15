@@ -1,0 +1,26 @@
+<svg width="900" height="24" viewBox="0 0 900 24" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="div-line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#222C39" stop-opacity="0"/>
+      <stop offset="20%"  stop-color="#222C39" stop-opacity="1"/>
+      <stop offset="80%"  stop-color="#222C39" stop-opacity="1"/>
+      <stop offset="100%" stop-color="#222C39" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="div-amber" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#FFB454" stop-opacity="0"/>
+      <stop offset="30%"  stop-color="#FFB454" stop-opacity="0.8"/>
+      <stop offset="50%"  stop-color="#FFB454" stop-opacity="1"/>
+      <stop offset="70%"  stop-color="#FFB454" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#FFB454" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="900" height="24" fill="#0B0E13"/>
+  <!-- base line -->
+  <rect x="0" y="11" width="900" height="1" fill="url(#div-line)"/>
+  <!-- amber scanning pulse -->
+  <rect x="0" y="11" width="120" height="1" fill="url(#div-amber)" opacity="0.9">
+    <animateTransform attributeName="transform" type="translate" values="-120,0;900,0;-120,0" dur="4s" repeatCount="indefinite" calcMode="linear"/>
+  </rect>
+  <!-- center diamond -->
+  <rect x="448" y="9" width="4" height="4" fill="#FFB454" opacity="0.7" transform="rotate(45 450 11)"/>
+</svg>

@@ -1,0 +1,47 @@
+<svg width="900" height="60" viewBox="0 0 900 60" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="pb" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0B0E13"/>
+      <stop offset="100%" stop-color="#0B0E13"/>
+    </linearGradient>
+  </defs>
+  <rect width="900" height="60" fill="#0B0E13"/>
+
+  <!-- Swatches - 7 colors, centered, each 80px wide with 12px gap -->
+  <!-- Total: 7*80 + 6*12 = 560+72 = 632, start x = (900-632)/2 = 134 -->
+
+  <!-- Deep Graphite #0B0E13 -->
+  <rect x="134" y="12" width="80" height="20" rx="3" fill="#0B0E13" stroke="#32404F" stroke-width="1"/>
+  <text x="174" y="46" font-family="'Bahnschrift','Segoe UI',Arial,sans-serif" font-size="7.5" fill="#8FA8BF" text-anchor="middle" letter-spacing="0.5">GRAPHITE</text>
+  <text x="174" y="55" font-family="'Consolas','Courier New',monospace" font-size="7" fill="#32404F" text-anchor="middle">#0B0E13</text>
+
+  <!-- Surface #11161E -->
+  <rect x="226" y="12" width="80" height="20" rx="3" fill="#11161E" stroke="#32404F" stroke-width="1"/>
+  <text x="266" y="46" font-family="'Bahnschrift','Segoe UI',Arial,sans-serif" font-size="7.5" fill="#8FA8BF" text-anchor="middle" letter-spacing="0.5">SURFACE</text>
+  <text x="266" y="55" font-family="'Consolas','Courier New',monospace" font-size="7" fill="#32404F" text-anchor="middle">#11161E</text>
+
+  <!-- Border #222C39 -->
+  <rect x="318" y="12" width="80" height="20" rx="3" fill="#222C39" stroke="#32404F" stroke-width="1"/>
+  <text x="358" y="46" font-family="'Bahnschrift','Segoe UI',Arial,sans-serif" font-size="7.5" fill="#8FA8BF" text-anchor="middle" letter-spacing="0.5">BORDER</text>
+  <text x="358" y="55" font-family="'Consolas','Courier New',monospace" font-size="7" fill="#32404F" text-anchor="middle">#222C39</text>
+
+  <!-- Optical Amber #FFB454 - highlighted -->
+  <rect x="410" y="8" width="80" height="28" rx="3" fill="#FFB454"/>
+  <text x="450" y="49" font-family="'Bahnschrift','Segoe UI',Arial,sans-serif" font-size="7.5" fill="#FFB454" text-anchor="middle" letter-spacing="0.5">AMBER</text>
+  <text x="450" y="58" font-family="'Consolas','Courier New',monospace" font-size="7" fill="#8FA8BF" text-anchor="middle">#FFB454</text>
+
+  <!-- Steel #8FA8BF -->
+  <rect x="502" y="12" width="80" height="20" rx="3" fill="#8FA8BF"/>
+  <text x="542" y="46" font-family="'Bahnschrift','Segoe UI',Arial,sans-serif" font-size="7.5" fill="#8FA8BF" text-anchor="middle" letter-spacing="0.5">STEEL</text>
+  <text x="542" y="55" font-family="'Consolas','Courier New',monospace" font-size="7" fill="#32404F" text-anchor="middle">#8FA8BF</text>
+
+  <!-- Text #EAF0F6 -->
+  <rect x="594" y="12" width="80" height="20" rx="3" fill="#EAF0F6"/>
+  <text x="634" y="46" font-family="'Bahnschrift','Segoe UI',Arial,sans-serif" font-size="7.5" fill="#8FA8BF" text-anchor="middle" letter-spacing="0.5">TEXT</text>
+  <text x="634" y="55" font-family="'Consolas','Courier New',monospace" font-size="7" fill="#32404F" text-anchor="middle">#EAF0F6</text>
+
+  <!-- Phosphor Green #4ADE80 -->
+  <rect x="686" y="12" width="80" height="20" rx="3" fill="#4ADE80"/>
+  <text x="726" y="46" font-family="'Bahnschrift','Segoe UI',Arial,sans-serif" font-size="7.5" fill="#4ADE80" text-anchor="middle" letter-spacing="0.5">PHOSPHOR</text>
+  <text x="726" y="55" font-family="'Consolas','Courier New',monospace" font-size="7" fill="#32404F" text-anchor="middle">#4ADE80</text>
+</svg>
