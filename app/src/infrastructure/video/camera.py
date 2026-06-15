@@ -214,9 +214,9 @@ def _open_camera(
 
     # ── Full probe: DSHOW first, then MSMF, then ANY as last resort ──────────
     attempts = backend_order or [
-        ("ANY",   cv2.CAP_ANY),    # deixa o OS escolher — mais rápido na maioria das máquinas
-        ("MSMF",  cv2.CAP_MSMF),   # Media Foundation — fallback Windows
-        ("DSHOW", cv2.CAP_DSHOW),  # DirectShow — lento em algumas câmeras, último recurso
+        ("DSHOW", cv2.CAP_DSHOW),  # DirectShow — ~300-600ms no Windows (mais rápido)
+        ("MSMF",  cv2.CAP_MSMF),   # Media Foundation — fallback (~2-4s)
+        ("ANY",   cv2.CAP_ANY),    # último recurso — resolve p/ MSMF no Windows 4.5+
     ]
 
     for name, backend_id in attempts:
@@ -375,6 +375,18 @@ class SingleCameraManager:
         8. Signal self._init_done regardless of success/failure so any waiter
            (e.g. a test that calls _init_done.wait()) is never deadlocked
         """
+        # Declara MTA para este thread antes de qualquer chamada COM/DirectShow.
+        # Sem isso, o COM usa o modelo padrão STA e marshala objetos DSHOW
+        # de volta ao STA do thread principal (Qt), bloqueando o event loop.
+        # COINIT_MULTITHREADED = 0x2 — cada objeto vive no seu próprio thread.
+        import sys as _sys  # noqa: PLC0415
+        if _sys.platform == "win32":
+            try:
+                import ctypes as _ctypes  # noqa: PLC0415
+                _ctypes.windll.ole32.CoInitializeEx(None, 0x2)
+            except Exception:
+                pass
+
         cap: Optional[cv2.VideoCapture] = None
         try:
             # Guard: caller may have called stop() before we got here
@@ -403,7 +415,13 @@ class SingleCameraManager:
                 pass
 
             # ── Single-shot resolution request ────────────────────────────
-            actual_w, actual_h = _apply_max_resolution(cap, self._resolution)
+            # Só negocia resolução quando explicitamente pedida. Forçar
+            # 1920×1080 por padrão dispara pipeline reset no driver (+1-2s).
+            if self._resolution is not None:
+                actual_w, actual_h = _apply_max_resolution(cap, self._resolution)
+            else:
+                actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
             # ── Optional stabilise / warmup ───────────────────────────────
             if self._stabilize_seconds > 0 and not self._stop_event.is_set():

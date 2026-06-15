@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +40,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 import onnxruntime as ort
+
+# ── Session cache ─────────────────────────────────────────────────────────────
+# A primeira criação de InferenceSession com DmlExecutionProvider compila shaders
+# D3D12 — processo global que pode levar 5–20s. O cache garante que isso acontece
+# uma única vez por processo (no pre-warm do startup) e todas as instâncias
+# subsequentes de IrisDetector reutilizam a mesma sessão já compilada.
+_default_session: "ort.InferenceSession | None" = None
+_default_session_lock = threading.Lock()
 
 logger = logging.getLogger(__name__)
 
@@ -120,22 +129,33 @@ class IrisDetector:
             raise FileNotFoundError(f"Modelo ONNX não encontrado: {resolved}")
 
         if providers is None:
-            all_p = ort.get_available_providers()
-            _providers = (
-                ["DmlExecutionProvider", "CPUExecutionProvider"]
-                if "DmlExecutionProvider" in all_p
-                else all_p
-            )
+            # CPUExecutionProvider: sem D3D12, sem marshaling COM, sem freeze de UI.
+            # ORT_ENABLE_ALL com threads paralelas dá ~30-50 ms/frame para YOLOv8-nano
+            # — suficiente para detecção de QR em tempo real.
+            _providers = ["CPUExecutionProvider"]
         else:
             _providers = providers
 
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if "DmlExecutionProvider" not in _providers:
-            opts.intra_op_num_threads = min(4, os.cpu_count() or 4)
-            opts.inter_op_num_threads = 1
+        opts.intra_op_num_threads = min(4, os.cpu_count() or 4)
+        opts.inter_op_num_threads = 1
 
-        self._session = ort.InferenceSession(str(resolved), sess_options=opts, providers=_providers)
+        # Reutiliza sessão já compilada quando disponível — evita re-compilação
+        # de shaders D3D12 (5–20s) a cada instanciação no mesmo processo.
+        global _default_session
+        _is_default = (model_path is None)
+
+        if _is_default and _default_session is not None:
+            self._session = _default_session
+        else:
+            session = ort.InferenceSession(str(resolved), sess_options=opts, providers=_providers)
+            if _is_default:
+                with _default_session_lock:
+                    if _default_session is None:
+                        _default_session = session
+            self._session = session
+
         self._input_name = self._session.get_inputs()[0].name
 
         logger.info(
