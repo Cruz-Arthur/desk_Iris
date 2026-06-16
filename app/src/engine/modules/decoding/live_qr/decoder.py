@@ -31,6 +31,10 @@ except Exception:
 
 from app.src.engine.modules.decoding.live_qr.filter import crop_with_padding, enhance_for_qr
 
+# Velocidade mínima (px/s escalada por VELOCITY_FACTOR) para ativar o duo-read.
+# Abaixo disso o QR está essencialmente parado e o crop do YOLO já é suficiente.
+_MIN_VEL_FOR_DUO_READ = 5.0
+
 
 def _has_aruco_qr() -> bool:
     try:
@@ -74,7 +78,19 @@ class QrDecoder:
         self,
         frame: np.ndarray,
         boxes: List[np.ndarray],
+        hints: Optional[List[Optional[Tuple[float, float, float, float, float]]]] = None,
     ) -> List[Tuple[Optional[str], Optional[np.ndarray], int, int]]:
+        """
+        Decode QR codes from YOLO bounding boxes.
+
+        hints : optional list aligned with `boxes`, one entry per detection:
+            (pred1_cx, pred1_cy, bbox_w, bbox_h, vel_mag)
+            When vel_mag > _MIN_VEL_FOR_DUO_READ and the detection has no VALID
+            cache entry, the decoder tries both the YOLO crop AND a crop centred
+            at the 1-frame-ahead predicted position (duo-read).  A successful
+            predicted-crop decode is cached at the predicted centroid so the next
+            YOLO frame gets an instant cache hit (pre-fetch).
+        """
         now = time.monotonic()
 
         self._spatial_cache = [
@@ -85,7 +101,8 @@ class QrDecoder:
 
         results: List[Tuple[Optional[str], Optional[np.ndarray], int, int]] = []
 
-        for pts in boxes:
+        for idx, pts in enumerate(boxes):
+            hint = hints[idx] if hints is not None and idx < len(hints) else None
             x, y, w, h = cv2.boundingRect(pts.astype(np.int32))
             cx, cy = x + w / 2.0, y + h / 2.0
 
@@ -123,6 +140,21 @@ class QrDecoder:
 
             # Região nova — primeira tentativa imediata
             text, patch, ox, oy = self._safe_decode(frame, pts)
+
+            # Duo-read: QR em movimento e ainda não lido — tenta também o crop predito.
+            # Se o crop predito decodificar, armazena no cache naquela posição
+            # (pre-fetch): no próximo frame o YOLO vai detectar lá e terá cache hit.
+            if not text and hint is not None:
+                p1cx, p1cy, bbox_w, bbox_h, vel_mag = hint
+                if vel_mag > _MIN_VEL_FOR_DUO_READ:
+                    text, patch, ox, oy = self._decode_at(frame, p1cx, p1cy, bbox_w, bbox_h)
+                    if text:
+                        self._spatial_cache.append({
+                            "cx": p1cx, "cy": p1cy,
+                            "text": text, "status": "VALID",
+                            "ts": time.monotonic(), "fails": 0,
+                        })
+
             new_entry: Dict[str, Any] = {
                 "cx": cx, "cy": cy,
                 "text": text,
@@ -134,6 +166,23 @@ class QrDecoder:
             results.append((text, patch, ox, oy))
 
         return results
+
+    def _decode_at(
+        self,
+        frame: np.ndarray,
+        cx: float, cy: float,
+        w: float, h: float,
+    ) -> Tuple[Optional[str], Optional[np.ndarray], int, int]:
+        """Build a bbox centred at (cx, cy) and decode it — used for duo-read."""
+        fh, fw = frame.shape[:2]
+        x1 = max(0, int(cx - w / 2))
+        y1 = max(0, int(cy - h / 2))
+        x2 = min(fw, int(cx + w / 2))
+        y2 = min(fh, int(cy + h / 2))
+        if x2 <= x1 or y2 <= y1:
+            return None, None, 0, 0
+        pts = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.int32)
+        return self._safe_decode(frame, pts)
 
     def _safe_decode(
         self,

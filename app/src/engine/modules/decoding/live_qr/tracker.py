@@ -58,8 +58,11 @@ class TrackedDetection:
 
     detection:  Detection
     track_id:   int
-    pred_cx:    float   # predicted centroid-x before this frame's match
-    pred_cy:    float   # predicted centroid-y before this frame's match
+    pred_cx:    float   # 10-frame-ahead ghost centroid x (visualization)
+    pred_cy:    float   # 10-frame-ahead ghost centroid y (visualization)
+    vel_mag:    float = 0.0   # velocity magnitude in px/s — drives duo-read decision
+    pred1_cx:   float = 0.0   # 1-frame-ahead centroid x — for decoder pre-fetch
+    pred1_cy:   float = 0.0   # 1-frame-ahead centroid y
 
     @property
     def x1(self) -> int:           return self.detection.x1
@@ -204,6 +207,12 @@ class _VelocityTrack:
         """Position at absolute time `ts` (used for matching gate)."""
         x_last, y_last, t_last = self._hist[-1]
         dt = max(ts - t_last, 0.0)
+        return x_last + self._vx * dt, y_last + self._vy * dt
+
+    def predict_next_1frame(self) -> Tuple[float, float]:
+        """Predicted centroid exactly 1 estimated frame ahead (for decoder pre-fetch)."""
+        dt = self._dt_frame()
+        x_last, y_last, _ = self._hist[-1]
         return x_last + self._vx * dt, y_last + self._vy * dt
 
     def predict_next(self) -> Tuple[float, float]:
@@ -351,15 +360,20 @@ class QrTracker:
                 # Update FIRST so velocity is refreshed from this detection,
                 # then predict_next() gives the next frame — ahead of YOLO box.
                 self._tracks[tid].update(cx, cy, w, h, now)
-                pred_cx, pred_cy = self._tracks[tid].predict_next()
+                pred_cx, pred_cy   = self._tracks[tid].predict_next()
+                p1cx, p1cy         = self._tracks[tid].predict_next_1frame()
+                vx, vy             = self._tracks[tid].velocity
+                vel_mag            = (vx * vx + vy * vy) ** 0.5
             else:
                 tid = self._next_id
                 self._next_id += 1
                 self._tracks[tid] = _VelocityTrack(tid, cx, cy, w, h, now)
                 assigned_ids.add(tid)
                 pred_cx, pred_cy = cx, cy   # new track — no velocity yet
+                p1cx, p1cy       = cx, cy
+                vel_mag          = 0.0
 
-            result.append(TrackedDetection(det, tid, pred_cx, pred_cy))
+            result.append(TrackedDetection(det, tid, pred_cx, pred_cy, vel_mag, p1cx, p1cy))
 
         # 4. Increment missed; expire stale tracks; collect ghosts ──────────────
         ghosts: List[GhostDetection] = []

@@ -351,7 +351,11 @@ class _DecodingWorker(QThread):
                     )
                     for d in detections
                 ]
-                decoded = self._decoder.decode(frame, boxes)
+                hints = [
+                    (d.pred1_cx, d.pred1_cy, float(d.width), float(d.height), d.vel_mag)
+                    for d in detections
+                ]
+                decoded = self._decoder.decode(frame, boxes, hints=hints)
                 results = [
                     {"detection": d, "text": text, "track_id": d.track_id}
                     for d, (text, _, _, _) in zip(detections, decoded)
