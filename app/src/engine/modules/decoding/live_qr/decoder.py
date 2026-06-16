@@ -60,14 +60,13 @@ class QrDecoder:
         self._payload_validator = payload_validator
 
         self._spatial_cache: List[Dict[str, Any]] = []
-        self._CACHE_RADIUS = 60.0
-        self._SUCCESS_TTL  = 3.0
-        # Backoff exponencial de falhas: primeira retentativa quase imediata
-        # (captura variação de ângulo/luz), depois dobra até o teto — uma
-        # região permanentemente ilegível deixa de drenar CPU.
-        self._FAIL_BASE = 0.08   # s — espera após a 1ª falha
-        self._FAIL_MAX  = 1.0    # s — teto do backoff
-        self._FAIL_KEEP = 3.0    # s — memória da região falhada
+        # Raio menor: QR em movimento pode cruzar 50px e herdar texto de outro código.
+        self._CACHE_RADIUS = 30.0
+        # TTL curto: cena dinâmica muda rápido, cache longo mascara troca de código.
+        self._SUCCESS_TTL  = 0.6
+        self._FAIL_BASE = 0.0
+        self._FAIL_MAX  = 0.0
+        self._FAIL_KEEP = 1.5
 
     # ── API pública ────────────────────────────────────────────────────────────
 
@@ -176,10 +175,10 @@ class QrDecoder:
                 return result, crop_wide, ox, oy
 
         # Pipeline de preprocessamento (lazy — para no primeiro hit).
-        # As variantes em escala de cinza vão DIRETO aos decoders — todos
-        # aceitam imagens 2D; converter gray→BGR→gray seria puro desperdício.
+        # upscale=2.0: INTER_LINEAR 5× mais rápido que Lanczos sem perda real
+        # para QRs em movimento — a qualidade do Otsu/adaptativo domina.
         last_img = crop_norm
-        for _name, variant in enhance_for_qr(crop_norm):
+        for _name, variant in enhance_for_qr(crop_norm, upscale=2.0):
             last_img = variant
             result = self._try_all_decoders(variant)
             if result:
@@ -189,28 +188,27 @@ class QrDecoder:
 
     def _try_all_decoders(self, img: np.ndarray) -> Optional[str]:
         """
-        Tenta todos os decoders disponíveis sobre uma mesma imagem.
+        Tenta todos os decoders sobre a mesma imagem. Gray convertido uma vez.
 
-        A conversão para cinza acontece UMA única vez aqui — os três
-        decoders aceitam entrada 2D, então nenhum reconverte internamente.
+        Ordem otimizada para leitura em movimento:
+          1. pyzbar  — mais rápido, maior hit-rate em condições normais
+          2. cv2     — fallback clássico, médio
+          3. Aruco   — lento, robusto para perspectiva/dano (último recurso)
         """
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
 
-        # 1. QRCodeDetectorAruco (mais robusto — trata perspectiva/dano)
-        if self._detector_aruco is not None:
-            result = self._run_aruco(gray)
-            if result:
-                return result
+        result = self._run_pyzbar(gray)
+        if result:
+            return result
 
-        # 2. QRCodeDetector clássico
         result = self._run_cv2(gray)
         if result:
             return result
 
-        # 3. pyzbar
-        result = self._run_pyzbar(gray)
-        if result:
-            return result
+        if self._detector_aruco is not None:
+            result = self._run_aruco(gray)
+            if result:
+                return result
 
         return None
 
