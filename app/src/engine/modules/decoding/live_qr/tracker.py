@@ -57,7 +57,9 @@ except ImportError:
     _NUMBA_AVAILABLE = False
     def _numba_njit(*args, **kwargs):  # type: ignore[misc]
         def decorator(fn): return fn
-        return decorator if args and not callable(args[0]) else args[0]
+        if args and callable(args[0]):
+            return args[0]   # @_numba_njit  (no parens)
+        return decorator      # @_numba_njit(cache=True)  (with parens)
 
 from app.src.engine.modules.decoding.live_qr.detector import Detection
 
