@@ -138,8 +138,13 @@ class IrisDetector:
 
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        opts.intra_op_num_threads = min(4, os.cpu_count() or 4)
+        opts.execution_mode           = ort.ExecutionMode.ORT_SEQUENTIAL
+        # Physical cores only — hyperthreads hurt throughput for single-model inference
+        _phys = max(1, (os.cpu_count() or 2) // 2)
+        opts.intra_op_num_threads = min(_phys, 4)
         opts.inter_op_num_threads = 1
+        opts.enable_mem_pattern   = True   # reuse allocations for fixed-shape inputs
+        opts.enable_cpu_mem_arena = True   # pre-allocate memory arena at session init
 
         # Reutiliza sessão já compilada quando disponível — evita re-compilação
         # de shaders D3D12 (5–20s) a cada instanciação no mesmo processo.
@@ -169,12 +174,16 @@ class IrisDetector:
     # ------------------------------------------------------------------
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
-        img = cv2.resize(frame, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-        # Modelos exportados pelo Ultralytics esperam entrada RGB — alimentar
-        # BGR direto da câmera degrada a confiança silenciosamente.
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) * (1.0 / 255.0)
-        return np.ascontiguousarray(img.transpose(2, 0, 1))[np.newaxis]
+        # Single C++ call: resize + BGR→RGB swap + normalize + NCHW layout.
+        # Replaces four Python-orchestrated steps (resize, cvtColor, astype, transpose).
+        return cv2.dnn.blobFromImage(
+            frame,
+            scalefactor=1.0 / 255.0,
+            size=(self.img_size, self.img_size),
+            mean=(0.0, 0.0, 0.0),
+            swapRB=True,
+            crop=False,
+        )
 
     def _postprocess(
         self,

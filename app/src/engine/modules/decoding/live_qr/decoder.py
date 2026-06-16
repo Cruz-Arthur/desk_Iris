@@ -23,6 +23,13 @@ import cv2
 import numpy as np
 
 try:
+    import zxingcpp as _zxingcpp
+    _ZXING_AVAILABLE = True
+except ImportError:
+    _zxingcpp = None  # type: ignore[assignment]
+    _ZXING_AVAILABLE = False
+
+try:
     from pyzbar.pyzbar import ZBarSymbol, decode as _pyzbar_decode
     _PYZBAR_AVAILABLE = True
 except Exception:
@@ -240,15 +247,21 @@ class QrDecoder:
         Tenta todos os decoders sobre a mesma imagem. Gray convertido uma vez.
 
         Ordem otimizada para leitura em movimento:
-          1. pyzbar  — mais rápido, maior hit-rate em condições normais
-          2. cv2     — fallback clássico, médio
-          3. Aruco   — lento, robusto para perspectiva/dano (último recurso)
+          1. zxing-cpp — GIL-releasing, batch API, melhor hit-rate (se disponível)
+          2. pyzbar    — ZBar clássico, fallback quando zxing não instalado
+          3. cv2       — fallback secundário
+          4. Aruco     — lento, robusto para perspectiva/dano (último recurso)
         """
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
 
-        result = self._run_pyzbar(gray)
-        if result:
-            return result
+        if _ZXING_AVAILABLE:
+            result = self._run_zxing(gray)
+            if result:
+                return result
+        else:
+            result = self._run_pyzbar(gray)
+            if result:
+                return result
 
         result = self._run_cv2(gray)
         if result:
@@ -259,6 +272,20 @@ class QrDecoder:
             if result:
                 return result
 
+        return None
+
+    def _run_zxing(self, gray: np.ndarray) -> Optional[str]:
+        try:
+            results = _zxingcpp.read_barcodes(
+                gray, formats=_zxingcpp.BarcodeFormat.QRCode
+            )
+            for r in results:
+                if r.valid:
+                    text = r.text.strip()
+                    if self._accept_text(text):
+                        return text
+        except Exception:
+            pass
         return None
 
     def _run_aruco(self, gray: np.ndarray) -> Optional[str]:
