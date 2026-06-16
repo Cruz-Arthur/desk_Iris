@@ -19,6 +19,8 @@ import time
 from typing import Dict, List, Optional, Any
 
 import cv2
+cv2.setUseOptimized(True)
+cv2.setNumThreads(max(1, (__import__('os').cpu_count() or 2) // 2))
 import numpy as np
 from PyQt6.QtCore import (
     Qt,
@@ -280,7 +282,7 @@ class _TrackingWorker(QThread):
 
     def submit_frame(self, frame: np.ndarray) -> None:
         with QMutexLocker(self._mutex):
-            self._pending = frame.copy()
+            self._pending = frame   # caller already owns this buffer
 
     def stop(self) -> None:
         self._running = False
@@ -1403,13 +1405,17 @@ class LiveQrView(QWidget):
     # ── Callbacks de câmera ───────────────────────────────────────────────────
 
     def _on_raw_frame(self, frame: np.ndarray) -> None:
+        # One copy early — shared between tracker and UI render.
+        # Edge enhancer already creates a new array; only copy when edges are off.
         if self._edges_enabled:
             frame = self._edge_enhancer.apply(frame)
+        else:
+            frame = frame.copy()
         tracker = self._tracker
         if tracker is not None and tracker.isRunning():
             tracker.submit_frame(frame)
         with QMutexLocker(self._ui_frame_mutex):
-            self._latest_ui_frame = frame.copy()
+            self._latest_ui_frame = frame   # no extra copy — same owned buffer
 
     def _pull_and_render(self) -> None:
         with QMutexLocker(self._ui_frame_mutex):
@@ -1422,7 +1428,7 @@ class LiveQrView(QWidget):
         display = frame
         if self._last_detections or self._last_ghosts:
             merged  = _merge_with_text(self._last_detections, self._last_decode_results)
-            display = _annotate(display, merged, self._last_ghosts)
+            display = _annotate(display.copy(), merged, self._last_ghosts)
         self._render_frame(display)
 
     # ── Slots de análise ──────────────────────────────────────────────────────

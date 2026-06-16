@@ -47,7 +47,41 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+# Optional Numba JIT — compiles distance matrix to LLVM on first call (~200ms),
+# then runs at near-C speed on subsequent calls. Falls back to pure Python if
+# numba is not installed.
+try:
+    from numba import njit as _numba_njit
+    _NUMBA_AVAILABLE = True
+except ImportError:
+    _NUMBA_AVAILABLE = False
+    def _numba_njit(*args, **kwargs):  # type: ignore[misc]
+        def decorator(fn): return fn
+        return decorator if args and not callable(args[0]) else args[0]
+
 from app.src.engine.modules.decoding.live_qr.detector import Detection
+
+
+@_numba_njit(cache=True)
+def _dist_matrix_nb(
+    det_cx: np.ndarray, det_cy: np.ndarray,
+    pred_x: np.ndarray, pred_y: np.ndarray,
+    last_x: np.ndarray, last_y: np.ndarray,
+) -> np.ndarray:
+    """Dual-hypothesis distance matrix compiled to LLVM via Numba (falls back to Python)."""
+    nd = det_cx.shape[0]
+    nt = pred_x.shape[0]
+    out = np.full((nd, nt), np.inf)
+    for i in range(nd):
+        for j in range(nt):
+            dpx = det_cx[i] - pred_x[j]
+            dpy = det_cy[i] - pred_y[j]
+            dlx = det_cx[i] - last_x[j]
+            dly = det_cy[i] - last_y[j]
+            d_pred = (dpx * dpx + dpy * dpy) ** 0.5
+            d_last = (dlx * dlx + dly * dly) ** 0.5
+            out[i, j] = d_pred if d_pred < d_last else d_last
+    return out
 
 
 # ── Published types ────────────────────────────────────────────────────────────
@@ -315,17 +349,13 @@ class QrTracker:
         assignments: Dict[int, int] = {}
 
         if nd and nt:
-            dist_m = np.full((nd, nt), np.inf)
-
-            for i, det in enumerate(detections):
-                cx = (det.x1 + det.x2) / 2.0
-                cy = (det.y1 + det.y2) / 2.0
-                for j, tid in enumerate(track_ids):
-                    px, py = predictions[tid]
-                    lx, ly = last_positions[tid]
-                    d_pred = ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
-                    d_last = ((cx - lx) ** 2 + (cy - ly) ** 2) ** 0.5
-                    dist_m[i, j] = min(d_pred, d_last)
+            det_cxs = np.array([(d.x1 + d.x2) / 2.0 for d in detections], dtype=np.float64)
+            det_cys = np.array([(d.y1 + d.y2) / 2.0 for d in detections], dtype=np.float64)
+            pred_xs = np.array([predictions[tid][0]    for tid in track_ids], dtype=np.float64)
+            pred_ys = np.array([predictions[tid][1]    for tid in track_ids], dtype=np.float64)
+            last_xs = np.array([last_positions[tid][0] for tid in track_ids], dtype=np.float64)
+            last_ys = np.array([last_positions[tid][1] for tid in track_ids], dtype=np.float64)
+            dist_m  = _dist_matrix_nb(det_cxs, det_cys, pred_xs, pred_ys, last_xs, last_ys)
 
             # Greedy: sort by distance, assign closest pairs within dynamic gate
             candidates = [
