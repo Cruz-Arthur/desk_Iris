@@ -542,6 +542,21 @@ class SingleCameraManager:
             self._pending_props.append((prop_id, value))
             return True  # accepted / queued
 
+    def get_property(self, prop_id: int) -> Optional[float]:
+        """Read a property from the underlying VideoCapture.
+
+        Returns None if the camera is not yet initialised.
+        Returns the raw OpenCV value otherwise — callers decide what's valid.
+        """
+        with self._props_lock:
+            cap = self._cap
+        if cap is None or not cap.isOpened():
+            return None
+        try:
+            return float(cap.get(prop_id))
+        except Exception:
+            return None
+
     # =====================================================
     # LOOP 1 - CAPTURA
     # =====================================================
