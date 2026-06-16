@@ -47,7 +47,9 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
     QStackedLayout,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -57,6 +59,7 @@ from app.src.UIX.components.shared import (
 )
 from app.src.engine.modules.decoding.live_qr.decoder import QrDecoder
 from app.src.engine.modules.decoding.live_qr.detector import Detection, IrisDetector
+from app.src.engine.modules.decoding.live_qr.tracker import GhostDetection, QrTracker, TrackedDetection
 from app.src.infrastructure.video.camera import SingleCameraManager
 from app.src.infrastructure.video.enhance import EdgeEnhancer
 
@@ -68,36 +71,212 @@ from app.src.infrastructure.video.enhance import EdgeEnhancer
 # BGR — âmbar (localizado, ainda sem leitura) / verde fósforo (decodificado)
 _BOX_COLOR     = (84, 180, 255)
 _BOX_HI_COLOR  = (128, 222, 74)
+_GHOST_COLOR   = (255, 60, 200)      # BGR magenta elétrico — predição de velocidade
 _LABEL_INK     = (19, 14, 11)        # BGR de #0B0E13
 _BOX_THICKNESS = 2
 _LABEL_FONT    = cv2.FONT_HERSHEY_SIMPLEX
 _HIST_MAX      = 50
 _RENDER_INTERVAL_MS = int((1 / 33) * 1000)  # ~30 ms
+# Distância mínima (px) entre predição e detecção para suprimir ghost estático.
+_GHOST_MIN_DIST = 5.0
 
 _SCANLINE_STEP  = 0.004   # fração da altura por tick de 16 ms
 _FLASH_MS       = 380     # ms — flash do card ao repetir leitura
 _REARM_S        = 1.0     # s — ausência mínima para contar novo "bip"
 
+# Definição dos controles de câmera expostos na sidebar.
+# (label, CAP_PROP_*, min, max, default)
+_CAM_CTRL_DEFS = [
+    ("BRILHO",    cv2.CAP_PROP_BRIGHTNESS,  0,   255, 128),
+    ("CONTRASTE", cv2.CAP_PROP_CONTRAST,    0,   255, 128),
+    ("SATURAÇÃO", cv2.CAP_PROP_SATURATION,  0,   255, 128),
+    ("NITIDEZ",   cv2.CAP_PROP_SHARPNESS,   0,   255, 128),
+    ("GANHO",     cv2.CAP_PROP_GAIN,        0,   255,  64),
+    ("EXPOSIÇÃO", cv2.CAP_PROP_EXPOSURE,  -13,    0,  -5),
+    ("FOCO",      cv2.CAP_PROP_FOCUS,       0,   255, 100),
+    ("ZOOM",      cv2.CAP_PROP_ZOOM,       100,  800, 100),
+]
+
+# Propriedades de modo automático: prop_id → (auto_prop_id, val_auto, val_manual)
+# DSHOW: CAP_PROP_AUTO_EXPOSURE = 3 (auto) / 1 (manual)
+_CAM_AUTO: Dict[int, tuple] = {
+    cv2.CAP_PROP_EXPOSURE: (cv2.CAP_PROP_AUTO_EXPOSURE, 3, 1),
+    cv2.CAP_PROP_FOCUS:    (cv2.CAP_PROP_AUTOFOCUS,     1, 0),
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Worker de análise pesada (lógica inalterada)
+# Helpers de anotação (usados por ambos os workers via pull-render)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _AnalysisWorker(QThread):
-    """Roda em background e processa o frame mais recente disponível."""
+def _draw_ghost_bbox(
+    img: np.ndarray,
+    cx: float, cy: float,
+    w: float, h: float,
+    track_id: int,
+    show_label: bool = False,
+) -> None:
+    """Draw a single ghost (predicted) bbox onto `img` (drawn on overlay, blended later)."""
+    x1 = int(cx - w / 2)
+    y1 = int(cy - h / 2)
+    x2 = int(cx + w / 2)
+    y2 = int(cy + h / 2)
+    c  = _GHOST_COLOR
 
-    frame_ready = pyqtSignal(object, object)
+    cv2.rectangle(img, (x1, y1), (x2, y2), c, 1)
+
+    corner = max(int(min(w, h) // 6), 6)
+    for bx, by, dx, dy in [
+        (x1, y1, +1, +1), (x2, y1, -1, +1),
+        (x2, y2, -1, -1), (x1, y2, +1, -1),
+    ]:
+        cv2.line(img, (bx, by), (bx + dx * corner, by), c, 1)
+        cv2.line(img, (bx, by), (bx, by + dy * corner), c, 1)
+
+    if show_label:
+        lbl = f"#{track_id}"
+        sc, th = 0.38, 1
+        (lw, lh), _ = cv2.getTextSize(lbl, _LABEL_FONT, sc, th)
+        cv2.rectangle(img, (x1, y1), (x1 + lw + 6, y1 + lh + 6), c, cv2.FILLED)
+        cv2.putText(img, lbl, (x1 + 3, y1 + lh + 3), _LABEL_FONT, sc, _LABEL_INK, th, cv2.LINE_AA)
+
+
+def _annotate(
+    frame: np.ndarray,
+    results: List[Dict[str, Any]],
+    ghosts: Optional[List[GhostDetection]] = None,
+) -> np.ndarray:
+    """
+    Draw detections and velocity-prediction ghost boxes.
+
+    Order:
+      1. Ghost boxes drawn directly at full opacity (branco-acinzentado, 1 px).
+         Skipped per-detection if predicted centroid < _GHOST_MIN_DIST from actual.
+      2. Real detection boxes on top.
+    """
+    # ── 1. Ghost boxes ─────────────────────────────────────────────────────────
+    for res in results:
+        d    = res["detection"]
+        pcx  = d.pred_cx
+        pcy  = d.pred_cy
+        acx  = (d.x1 + d.x2) / 2.0
+        acy  = (d.y1 + d.y2) / 2.0
+        dist = ((pcx - acx) ** 2 + (pcy - acy) ** 2) ** 0.5
+        if dist >= _GHOST_MIN_DIST:
+            _draw_ghost_bbox(frame, pcx, pcy, float(d.width), float(d.height),
+                             d.track_id, show_label=False)
+
+    for g in (ghosts or []):
+        _draw_ghost_bbox(frame, g.pred_cx, g.pred_cy,
+                         g.est_width, g.est_height,
+                         g.track_id, show_label=True)
+
+    # ── 2. Real detection boxes ────────────────────────────────────────────────
+    for res in results:
+        d        = res["detection"]
+        raw_text = res.get("text")
+        track_id = res.get("track_id", 0)
+        color    = _BOX_HI_COLOR if raw_text else _BOX_COLOR
+
+        cv2.rectangle(frame, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), color, _BOX_THICKNESS)
+
+        corner = min(d.width, d.height) // 5
+        for bx, by, dx, dy in [
+            (int(d.x1), int(d.y1), +1, +1),
+            (int(d.x2), int(d.y1), -1, +1),
+            (int(d.x2), int(d.y2), -1, -1),
+            (int(d.x1), int(d.y2), +1, -1),
+        ]:
+            cv2.line(frame, (bx, by), (bx + dx * corner, by), color, _BOX_THICKNESS + 1)
+            cv2.line(frame, (bx, by), (bx, by + dy * corner), color, _BOX_THICKNESS + 1)
+
+        id_lbl = f"#{track_id}"
+        id_scale, id_thick = 0.40, 1
+        (iw, ih), _ = cv2.getTextSize(id_lbl, _LABEL_FONT, id_scale, id_thick)
+        ix1, iy1 = int(d.x1), int(d.y1)
+        cv2.rectangle(frame, (ix1, iy1), (ix1 + iw + 6, iy1 + ih + 6), color, cv2.FILLED)
+        cv2.putText(frame, id_lbl, (ix1 + 3, iy1 + ih + 3),
+                    _LABEL_FONT, id_scale, _LABEL_INK, id_thick, cv2.LINE_AA)
+
+        if raw_text:
+            content = str(raw_text)
+            if len(content) > 20:
+                content = content[:17] + "..."
+        else:
+            content = "LENDO..."
+        scale, thick = 0.42, 1
+        (tw, th), _ = cv2.getTextSize(content, _LABEL_FONT, scale, thick)
+        ty = int(d.y1) - 8 if int(d.y1) - 8 > th else int(d.y2) + th + 8
+        cv2.rectangle(frame,
+                      (int(d.x1), ty - th - 4), (int(d.x1) + tw + 8, ty + 4),
+                      color, cv2.FILLED)
+        cv2.putText(frame, content, (int(d.x1) + 4, ty),
+                    _LABEL_FONT, scale, _LABEL_INK, thick, cv2.LINE_AA)
+
+    return frame
+
+
+def _merge_with_text(
+    detections: List[TrackedDetection],
+    decode_results: List[Dict[str, Any]],
+    max_dist: int = 100,
+) -> List[Dict[str, Any]]:
+    """Une TrackedDetections frescas com textos do decoder por proximidade de centróide.
+
+    Prioriza match por track_id; cai para distância se o track_id não estiver
+    nos resultados do decoder (decoder é mais lento, pode estar stale).
+    """
+    # Índice rápido: track_id → texto decodificado
+    id_to_text: Dict[int, Optional[str]] = {}
+    for r in decode_results:
+        tid = r.get("track_id")
+        if tid is not None:
+            id_to_text[tid] = r.get("text")
+
+    merged = []
+    for d in detections:
+        text: Optional[str] = None
+
+        # 1. Match direto por track_id
+        if d.track_id in id_to_text:
+            text = id_to_text[d.track_id]
+        else:
+            # 2. Fallback: centróide mais próximo
+            cx   = (d.x1 + d.x2) // 2
+            cy   = (d.y1 + d.y2) // 2
+            best = max_dist * max_dist
+            for r in decode_results:
+                rd    = r["detection"]
+                rdcx  = (rd.x1 + rd.x2) // 2
+                rdcy  = (rd.y1 + rd.y2) // 2
+                dist2 = (rdcx - cx) ** 2 + (rdcy - cy) ** 2
+                if dist2 < best:
+                    best = dist2
+                    text = r.get("text")
+
+        merged.append({"detection": d, "text": text, "track_id": d.track_id})
+    return merged
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker 1 — Tracking (só YOLO, velocidade máxima)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _TrackingWorker(QThread):
+    """Roda YOLO + QrTracker e emite TrackedDetections imediatamente.
+
+    O QrTracker atribui IDs estáveis entre frames sem depender de decodificação.
+    A UI vê posição e ID atualizados a cada inferência (~20–30 fps com CPU).
+    """
+
+    boxes_ready = pyqtSignal(object, object, object)  # (List[TrackedDetection], List[GhostDetection], frame)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        # IrisDetector é inicializado dentro de run() para não bloquear a UI
-        # (DirectML compila shaders na primeira carga — pode levar vários segundos)
         self._engine: Optional[IrisDetector] = None
-        self._decoder  = QrDecoder()
-        self._running  = True
-        self._mutex    = QMutex()
+        self._running = True
+        self._mutex   = QMutex()
         self._pending: Optional[np.ndarray] = None
-        self._busy     = False
 
     def submit_frame(self, frame: np.ndarray) -> None:
         with QMutexLocker(self._mutex):
@@ -107,78 +286,79 @@ class _AnalysisWorker(QThread):
         self._running = False
 
     def run(self) -> None:
-        self._engine = IrisDetector()  # inicializa na thread do worker
+        self._engine  = IrisDetector()
+        qr_tracker    = QrTracker(max_missed_s=0.6)
         while self._running:
             with QMutexLocker(self._mutex):
-                frame = self._pending
+                frame         = self._pending
                 self._pending = None
-                if frame is not None:
-                    self._busy = True
-
             if frame is None:
-                self.msleep(15)
+                self.msleep(10)
                 continue
-
-            if self._engine is None:
-                self.msleep(15)
-                continue
-
             try:
-                annotated, results = self._process(frame)
-                self.frame_ready.emit(annotated, results)
+                detections      = self._engine.detect(frame)
+                tracked, ghosts = qr_tracker.update(detections)
+                self.boxes_ready.emit(tracked, ghosts, frame)
             except Exception as exc:
-                print(f"[_AnalysisWorker] Erro crítico na inferência: {exc}")
-            finally:
-                with QMutexLocker(self._mutex):
-                    self._busy = False
+                print(f"[Tracker] {exc}")
 
-    def _process(
-        self, frame: np.ndarray
-    ) -> tuple[np.ndarray, List[Dict[str, Any]]]:
-        detections: List[Detection] = self._engine.detect(frame)
-        results = []
-        boxes = []
-        for d in detections:
-            pts = np.array([
-                [d.x1, d.y1], [d.x2, d.y1], [d.x2, d.y2], [d.x1, d.y2]
-            ], dtype=np.int32)
-            boxes.append(pts)
-        decoded_tuples = self._decoder.decode(frame, boxes)
-        for d, (text, _patch, _ox, _oy) in zip(detections, decoded_tuples):
-            results.append({"detection": d, "text": text})
-        return np.array([]), results
 
-    @staticmethod
-    def _annotate(
-        frame: np.ndarray,
-        results: List[Dict[str, Any]],
-    ) -> np.ndarray:
-        for res in results:
-            d = res["detection"]
-            raw_text = res["text"]
-            color = _BOX_HI_COLOR if raw_text else _BOX_COLOR
-            cv2.rectangle(frame, (int(d.x1), int(d.y1)), (int(d.x2), int(d.y2)), color, _BOX_THICKNESS)
-            corner = min(d.width, d.height) // 5
-            for cx, cy, dx, dy in [
-                (int(d.x1), int(d.y1), +1, +1),
-                (int(d.x2), int(d.y1), -1, +1),
-                (int(d.x2), int(d.y2), -1, -1),
-                (int(d.x1), int(d.y2), +1, -1),
-            ]:
-                cv2.line(frame, (cx, cy), (int(cx + dx * corner), cy), color, _BOX_THICKNESS + 1)
-                cv2.line(frame, (cx, cy), (cx, int(cy + dy * corner)), color, _BOX_THICKNESS + 1)
-            label = str(raw_text) if raw_text else "LENDO..."
-            if len(label) > 20:
-                label = label[:17] + "..."
-            scale, thick = 0.45, 1
-            (tw, th), _ = cv2.getTextSize(label, _LABEL_FONT, scale, thick)
-            ty = int(d.y1) - 8 if int(d.y1) - 8 > th else int(d.y2) + th + 8
-            cv2.rectangle(frame,
-                          (int(d.x1), ty - th - 4), (int(d.x1) + tw + 8, ty + 4),
-                          color, cv2.FILLED)
-            cv2.putText(frame, label, (int(d.x1) + 4, ty),
-                        _LABEL_FONT, scale, _LABEL_INK, thick, cv2.LINE_AA)
-        return frame
+# ─────────────────────────────────────────────────────────────────────────────
+# Worker 2 — Decoding (só QR decode, LIFO, assíncrono)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _DecodingWorker(QThread):
+    """Recebe (frame, detecções) do tracker e tenta decodificar os QR Codes.
+
+    Roda em paralelo com o tracker: o tracker nunca espera o decode.
+    Buffer LIFO: se o decoder ainda está ocupado quando chega um novo par,
+    o par antigo é descartado — só importa o mais recente.
+    """
+
+    decode_ready = pyqtSignal(object)   # List[Dict[str, Any]]
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._decoder  = QrDecoder()
+        self._running  = True
+        self._mutex    = QMutex()
+        self._pending: Optional[tuple] = None   # (frame, List[TrackedDetection])
+
+    def submit(self, frame: np.ndarray, detections: List[TrackedDetection]) -> None:
+        with QMutexLocker(self._mutex):
+            if not detections:
+                self._pending = None
+                return
+            self._pending = (frame, list(detections))
+
+    def stop(self) -> None:
+        self._running = False
+
+    def run(self) -> None:
+        while self._running:
+            with QMutexLocker(self._mutex):
+                item          = self._pending
+                self._pending = None
+            if item is None:
+                self.msleep(15)
+                continue
+            frame, detections = item
+            try:
+                boxes = [
+                    np.array(
+                        [[d.x1, d.y1], [d.x2, d.y1], [d.x2, d.y2], [d.x1, d.y2]],
+                        dtype=np.int32,
+                    )
+                    for d in detections
+                ]
+                decoded = self._decoder.decode(frame, boxes)
+                results = [
+                    {"detection": d, "text": text, "track_id": d.track_id}
+                    for d, (text, _, _, _) in zip(detections, decoded)
+                ]
+                self.decode_ready.emit(results)
+            except Exception as exc:
+                print(f"[Decoder] {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -363,11 +543,276 @@ class _HistoryCard(QFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Slider individual de câmera
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SliderRow(QWidget):
+    """Label + valor + QSlider horizontal + toggle AUTO opcional."""
+
+    prop_changed = pyqtSignal(int, float)   # (prop_id, value)
+    auto_changed = pyqtSignal(int, float)   # (auto_prop_id, value)
+
+    def __init__(self, label: str, prop_id: int, lo: int, hi: int,
+                 default: int, parent=None) -> None:
+        super().__init__(parent)
+        self._prop_id  = prop_id
+        self._lo       = lo
+        self._hi       = hi
+        self._default  = default
+        self._auto_info = _CAM_AUTO.get(prop_id)
+        self._is_auto   = False
+
+        self.setStyleSheet("background:transparent;")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 8, 12, 6)
+        root.setSpacing(4)
+
+        # ── header: label · AUTO · valor ─────────────────────────────────────
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(0, 0, 0, 0)
+        hdr.setSpacing(6)
+
+        lbl_w = QLabel(label)
+        lbl_w.setStyleSheet(
+            f"color:{C['text_muted']}; font-family:{F_DISPLAY};"
+            "font-size:9px; font-weight:700; letter-spacing:1.5px;"
+        )
+        hdr.addWidget(lbl_w, stretch=1)
+
+        if self._auto_info:
+            self._auto_btn = QPushButton("AUTO")
+            self._auto_btn.setFixedSize(40, 17)
+            self._auto_btn.setCheckable(True)
+            self._auto_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            self._auto_btn.clicked.connect(self._on_auto_toggled)
+            self._apply_auto_style(False)
+            hdr.addWidget(self._auto_btn)
+
+        self._val_lbl = QLabel(str(default))
+        self._val_lbl.setFixedWidth(32)
+        self._val_lbl.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._val_lbl.setStyleSheet(
+            f"color:{C['primary']}; font-family:{F_DATA};"
+            "font-size:11px; font-weight:700;"
+        )
+        hdr.addWidget(self._val_lbl)
+        root.addLayout(hdr)
+
+        # ── slider ────────────────────────────────────────────────────────────
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(lo, hi)
+        self._slider.setValue(default)
+        self._slider.setFixedHeight(20)
+        self._slider.setStyleSheet(f"""
+            QSlider::groove:horizontal {{
+                height: 3px;
+                background: rgba(255,180,84,0.15);
+                border-radius: 2px;
+            }}
+            QSlider::sub-page:horizontal {{
+                background: rgba(255,180,84,0.65);
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                width: 12px; height: 12px;
+                background: {C['primary']};
+                border-radius: 6px;
+                margin: -5px 0;
+            }}
+            QSlider::groove:horizontal:disabled {{
+                background: rgba(255,255,255,0.06);
+            }}
+            QSlider::sub-page:horizontal:disabled {{
+                background: rgba(255,255,255,0.1);
+            }}
+            QSlider::handle:horizontal:disabled {{
+                background: {C['text_muted']};
+            }}
+        """)
+        self._slider.valueChanged.connect(lambda v: self._val_lbl.setText(str(v)))
+        self._slider.sliderReleased.connect(self._on_released)
+        root.addWidget(self._slider)
+
+    # ── slots ─────────────────────────────────────────────────────────────────
+
+    def _on_released(self) -> None:
+        self.prop_changed.emit(self._prop_id, float(self._slider.value()))
+
+    def _on_auto_toggled(self, checked: bool) -> None:
+        self._is_auto = checked
+        self._apply_auto_style(checked)
+        self._slider.setEnabled(not checked)
+        if self._auto_info:
+            auto_prop_id, auto_on, auto_off = self._auto_info
+            self.auto_changed.emit(auto_prop_id, float(auto_on if checked else auto_off))
+
+    def _apply_auto_style(self, active: bool) -> None:
+        if active:
+            self._auto_btn.setStyleSheet(
+                f"background:{C['primary']}; color:{C['bg']}; border:none;"
+                f" border-radius:3px; font-family:{F_DISPLAY}; font-size:8px;"
+                " font-weight:700; letter-spacing:1px;"
+            )
+        else:
+            self._auto_btn.setStyleSheet(
+                f"background:transparent; color:{C['text_muted']};"
+                f" border:1px solid {C['border']}; border-radius:3px;"
+                f" font-family:{F_DISPLAY}; font-size:8px;"
+                " font-weight:700; letter-spacing:1px;"
+            )
+
+    # ── API ───────────────────────────────────────────────────────────────────
+
+    def set_value(self, value: float) -> None:
+        v = int(max(self._lo, min(self._hi, round(value))))
+        self._slider.blockSignals(True)
+        self._slider.setValue(v)
+        self._slider.blockSignals(False)
+        self._val_lbl.setText(str(v))
+
+    def reset_to_default(self) -> None:
+        self.set_value(self._default)
+        self.prop_changed.emit(self._prop_id, float(self._default))
+        if self._auto_info and self._is_auto:
+            self._is_auto = False
+            self._auto_btn.setChecked(False)
+            self._apply_auto_style(False)
+            self._slider.setEnabled(True)
+            auto_prop_id, _, auto_off = self._auto_info
+            self.auto_changed.emit(auto_prop_id, float(auto_off))
+
+    @property
+    def prop_id(self) -> int:
+        return self._prop_id
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Painel de controles de câmera
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _CameraControls(QFrame):
+    """Scroll de _SliderRow com botões de sincronização e reset."""
+
+    def __init__(self, cam_getter, parent=None) -> None:
+        super().__init__(parent)
+        self._cam_getter = cam_getter
+        self._rows: List[_SliderRow] = []
+
+        self.setStyleSheet("background:transparent;")
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── botão de leitura ──────────────────────────────────────────────────
+        sync_btn = QPushButton("↺  LER DA CÂMERA")
+        sync_btn.setFixedHeight(36)
+        sync_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        sync_btn.setToolTip("Sincronizar sliders com os valores atuais do driver")
+        sync_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent;
+                border: none;
+                border-bottom: 1px solid {C['border']};
+                color: {C['text_muted']};
+                font-family: {F_DISPLAY}; font-size: 10px;
+                font-weight: 600; letter-spacing: 2px;
+            }}
+            QPushButton:hover {{ color:{C['primary']}; }}
+            QPushButton:pressed {{ background:rgba(255,180,84,0.05); color:{C['primary']}; }}
+        """)
+        sync_btn.clicked.connect(self.sync_from_camera)
+        root.addWidget(sync_btn)
+
+        # ── sliders ───────────────────────────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("background:transparent; border:none;")
+
+        container = QWidget()
+        container.setStyleSheet("background:transparent;")
+        vl = QVBoxLayout(container)
+        vl.setContentsMargins(0, 4, 0, 4)
+        vl.setSpacing(0)
+
+        for label, prop_id, lo, hi, default in _CAM_CTRL_DEFS:
+            row = _SliderRow(label, prop_id, lo, hi, default)
+            row.prop_changed.connect(self._on_prop)
+            row.auto_changed.connect(self._on_auto)
+            self._rows.append(row)
+            vl.addWidget(row)
+            div = QFrame()
+            div.setFixedHeight(1)
+            div.setStyleSheet(f"background:{C['border']}; border:none;")
+            vl.addWidget(div)
+
+        vl.addStretch()
+        scroll.setWidget(container)
+        root.addWidget(scroll, stretch=1)
+
+        # ── botão de reset ────────────────────────────────────────────────────
+        reset_btn = QPushButton("⌫  RESTAURAR PADRÕES")
+        reset_btn.setFixedHeight(34)
+        reset_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        reset_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; border: none;
+                border-top: 1px solid {C['border']};
+                color: {C['text_muted']};
+                font-family: {F_DISPLAY}; font-size: 10px;
+                font-weight: 600; letter-spacing: 2px;
+            }}
+            QPushButton:hover {{ color:{C['danger']}; background:rgba(255,122,122,0.06); }}
+            QPushButton:pressed {{ background:rgba(255,122,122,0.12); }}
+        """)
+        reset_btn.clicked.connect(self._reset_all)
+        root.addWidget(reset_btn)
+
+    # ── slots ─────────────────────────────────────────────────────────────────
+
+    def _on_prop(self, prop_id: int, value: float) -> None:
+        cam = self._cam_getter()
+        if cam is not None:
+            cam.set_property(prop_id, value)
+
+    def _on_auto(self, auto_prop_id: int, value: float) -> None:
+        cam = self._cam_getter()
+        if cam is not None:
+            cam.set_property(auto_prop_id, value)
+
+    def sync_from_camera(self) -> None:
+        """Lê valores actuais do driver e atualiza todos os sliders."""
+        cam = self._cam_getter()
+        if cam is None:
+            return
+        for row in self._rows:
+            # Sincroniza estado AUTO primeiro (exposure, focus)
+            if row._auto_info:
+                auto_prop_id, auto_on, _ = row._auto_info
+                aval = cam.get_property(auto_prop_id)
+                if aval is not None:
+                    is_auto = (int(round(aval)) == auto_on)
+                    if is_auto != row._is_auto:
+                        row._auto_btn.setChecked(is_auto)
+                        row._on_auto_toggled(is_auto)
+            # Sincroniza valor numérico
+            val = cam.get_property(row.prop_id)
+            if val is not None and row._lo <= val <= row._hi:
+                row.set_value(val)
+
+    def _reset_all(self) -> None:
+        for row in self._rows:
+            row.reset_to_default()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Painel lateral — registro de leituras
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _SidePanel(QFrame):
-    def __init__(self, parent=None) -> None:
+    def __init__(self, cam_getter=None, parent=None) -> None:
         super().__init__(parent)
         self.setFixedWidth(290)
         self.setObjectName("SidePanel")
@@ -382,43 +827,42 @@ class _SidePanel(QFrame):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Header ──────────────────────────────────────────────────────────
-        header = QFrame()
-        header.setObjectName("SPH")
-        header.setFixedHeight(44)
-        header.setStyleSheet(f"""
-            #SPH {{
-                background: {C['card']};
-                border-bottom: 2px solid {C['primary']};
-            }}
-        """)
-        hl = QHBoxLayout(header)
-        hl.setContentsMargins(14, 0, 14, 0)
-        hl.setSpacing(8)
-
-        title = QLabel("LEITURAS")
-        title.setStyleSheet(
-            f"color:{C['primary']}; font-family:{F_DISPLAY};"
-            "font-size:11px; font-weight:700; letter-spacing:4px;"
-            " background:transparent;"
+        # ── Tab bar ──────────────────────────────────────────────────────────
+        tab_bar = QFrame()
+        tab_bar.setObjectName("SPTabBar")
+        tab_bar.setFixedHeight(44)
+        tab_bar.setStyleSheet(
+            f"#SPTabBar {{ background:{C['card']}; border-bottom:1px solid {C['border']}; }}"
         )
-        hl.addWidget(title, stretch=1)
+        tl = QHBoxLayout(tab_bar)
+        tl.setContentsMargins(0, 0, 0, 0)
+        tl.setSpacing(0)
 
-        self._hb = QLabel("●")
-        self._hb.setStyleSheet(f"color:{C['text_muted']}; font-size:8px; background:transparent;")
-        hl.addWidget(self._hb)
+        self._tab_reads = QPushButton("LEITURAS")
+        self._tab_cam   = QPushButton("CÂMERA")
+        for btn in (self._tab_reads, self._tab_cam):
+            btn.setFixedHeight(44)
+            btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
 
-        self._count_lbl = QLabel("0")
-        self._count_lbl.setFixedWidth(36)
-        self._count_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._count_lbl.setStyleSheet(
-            f"color:{C['text']}; font-family:{F_DATA};"
-            "font-size:11px; font-weight:700; background:transparent;"
-        )
-        hl.addWidget(self._count_lbl)
-        root.addWidget(header)
+        tl.addWidget(self._tab_reads, stretch=1)
+        sep_v = QFrame()
+        sep_v.setFixedWidth(1)
+        sep_v.setStyleSheet(f"background:{C['border']}; border:none;")
+        tl.addWidget(sep_v)
+        tl.addWidget(self._tab_cam, stretch=1)
+        root.addWidget(tab_bar)
 
-        # ── Stats ────────────────────────────────────────────────────────────
+        # ── Stacked pages ────────────────────────────────────────────────────
+        self._pages = QStackedWidget()
+        root.addWidget(self._pages, stretch=1)
+
+        # ── Page 0: Leituras ─────────────────────────────────────────────────
+        p_reads = QWidget()
+        p_reads.setStyleSheet("background:transparent;")
+        pl = QVBoxLayout(p_reads)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.setSpacing(0)
+
         stats = QFrame()
         stats.setObjectName("SPS")
         stats.setFixedHeight(58)
@@ -434,13 +878,11 @@ class _SidePanel(QFrame):
         for i, w in enumerate([self._stat_reads, self._stat_scene, self._stat_fps]):
             sl.addWidget(w, stretch=1)
             if i < 2:
-                div = QFrame()
-                div.setFixedWidth(1)
-                div.setStyleSheet(f"background:{C['border']}; border:none;")
-                sl.addWidget(div)
-        root.addWidget(stats)
+                d = QFrame(); d.setFixedWidth(1)
+                d.setStyleSheet(f"background:{C['border']}; border:none;")
+                sl.addWidget(d)
+        pl.addWidget(stats)
 
-        # ── Scroll do registro ────────────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -450,8 +892,6 @@ class _SidePanel(QFrame):
         self._hist_layout = QVBoxLayout(self._hist_container)
         self._hist_layout.setContentsMargins(8, 8, 8, 8)
         self._hist_layout.setSpacing(4)
-
-        # Estado vazio: convite à ação, não decoração
         self._empty_lbl = QLabel(
             "Nenhuma leitura ainda.\nAproxime um código QR da câmera."
         )
@@ -459,14 +899,13 @@ class _SidePanel(QFrame):
         self._empty_lbl.setWordWrap(True)
         self._empty_lbl.setStyleSheet(
             f"color:{C['text_muted']}; font-family:{F_BODY};"
-            "font-size:11px; padding: 22px 10px; background:transparent;"
+            "font-size:11px; padding:22px 10px; background:transparent;"
         )
         self._hist_layout.addWidget(self._empty_lbl)
         self._hist_layout.addStretch()
         scroll.setWidget(self._hist_container)
-        root.addWidget(scroll, stretch=1)
+        pl.addWidget(scroll, stretch=1)
 
-        # ── Footer ────────────────────────────────────────────────────────────
         clear_btn = QPushButton("⌫  LIMPAR LEITURAS")
         clear_btn.setFixedHeight(34)
         clear_btn.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -479,26 +918,26 @@ class _SidePanel(QFrame):
                 font-family: {F_DISPLAY}; font-size: 10px;
                 font-weight: 600; letter-spacing: 2px;
             }}
-            QPushButton:hover {{
-                color: {C['danger']};
-                background: rgba(255, 122, 122, 0.06);
-            }}
-            QPushButton:focus {{
-                color: {C['danger']};
-                border-top: 1px solid {C['danger']};
-            }}
-            QPushButton:pressed {{
-                color: {C['danger']};
-                background: rgba(255, 122, 122, 0.12);
-            }}
+            QPushButton:hover {{ color:{C['danger']}; background:rgba(255,122,122,0.06); }}
+            QPushButton:focus {{ color:{C['danger']}; border-top:1px solid {C['danger']}; }}
+            QPushButton:pressed {{ color:{C['danger']}; background:rgba(255,122,122,0.12); }}
         """)
         clear_btn.clicked.connect(self.clear_history)
-        root.addWidget(clear_btn)
+        pl.addWidget(clear_btn)
 
-        self._history_count = 0       # total de bips (inclui repetições)
-        # text → {"card": _HistoryCard, "last_ts": float}
-        # Um novo "bip" do mesmo código só conta após _REARM_S de ausência —
-        # presença contínua no frame NÃO infla o contador.
+        self._pages.addWidget(p_reads)   # index 0
+
+        # ── Page 1: Câmera ───────────────────────────────────────────────────
+        self._cam_controls = _CameraControls(cam_getter or (lambda: None))
+        self._pages.addWidget(self._cam_controls)   # index 1
+
+        # ── Tab wiring ────────────────────────────────────────────────────────
+        self._tab_reads.clicked.connect(lambda: self._switch_tab(0))
+        self._tab_cam.clicked.connect(lambda: self._switch_tab(1))
+        self._apply_tab_styles(0)
+
+        # ── State ─────────────────────────────────────────────────────────────
+        self._history_count = 0
         self._seen: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
@@ -525,6 +964,37 @@ class _SidePanel(QFrame):
         vl.addWidget(val)
         vl.addWidget(lbl)
         return w
+
+    # ── Tab helpers ───────────────────────────────────────────────────────────
+
+    def _switch_tab(self, idx: int) -> None:
+        self._pages.setCurrentIndex(idx)
+        self._apply_tab_styles(idx)
+        if idx == 1:
+            self._cam_controls.sync_from_camera()
+
+    def _apply_tab_styles(self, active: int) -> None:
+        _a = f"""
+            QPushButton {{
+                background: transparent; border: none;
+                border-bottom: 2px solid {C['primary']};
+                color: {C['primary']};
+                font-family: {F_DISPLAY}; font-size: 10px;
+                font-weight: 700; letter-spacing: 3px;
+            }}
+        """
+        _i = f"""
+            QPushButton {{
+                background: transparent; border: none;
+                border-bottom: 2px solid transparent;
+                color: {C['text_muted']};
+                font-family: {F_DISPLAY}; font-size: 10px;
+                font-weight: 600; letter-spacing: 3px;
+            }}
+            QPushButton:hover {{ color:{C['text']}; }}
+        """
+        self._tab_reads.setStyleSheet(_a if active == 0 else _i)
+        self._tab_cam.setStyleSheet(_a if active == 1 else _i)
 
     def _get_stat_val(self, w: QWidget) -> QLabel:
         return w.findChild(QLabel, "val")
@@ -567,21 +1037,27 @@ class _SidePanel(QFrame):
         self._heartbeat()
 
     def _sync_counters(self) -> None:
-        self._count_lbl.setText(str(self._history_count))
         self._get_stat_val(self._stat_reads).setText(str(self._history_count))
 
     def _heartbeat(self) -> None:
-        """Pulsa o indicador ● no header por 200 ms a cada leitura."""
-        self._hb.setStyleSheet(
-            f"color:{C['success']}; font-size:8px; background:transparent;"
-        )
-        QTimer.singleShot(200, self._hb_off)
+        """Pulsa o tab LEITURAS em verde por 200ms a cada nova leitura."""
+        try:
+            self._tab_reads.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; border: none;
+                    border-bottom: 2px solid {C['success']};
+                    color: {C['success']};
+                    font-family: {F_DISPLAY}; font-size: 10px;
+                    font-weight: 700; letter-spacing: 3px;
+                }}
+            """)
+            QTimer.singleShot(200, self._hb_off)
+        except RuntimeError:
+            pass
 
     def _hb_off(self) -> None:
         try:
-            self._hb.setStyleSheet(
-                f"color:{C['text_muted']}; font-size:8px; background:transparent;"
-            )
+            self._apply_tab_styles(self._pages.currentIndex())
         except RuntimeError:
             pass
 
@@ -604,7 +1080,9 @@ class _SidePanel(QFrame):
 class LiveQrView(QWidget):
     """Tela de detecção ao vivo usando IrisDetector."""
 
-    _frame_signal = pyqtSignal(object, object)
+    # Tracker emite bboxes (rápido); decoder emite textos (assíncrono)
+    _boxes_sig  = pyqtSignal(object, object)   # (List[TrackedDetection], frame)
+    _decode_sig = pyqtSignal(object)           # List[Dict]
 
     _STATE_TEXT = {
         "idle":    "EM ESPERA",
@@ -617,14 +1095,18 @@ class LiveQrView(QWidget):
         self._on_back = on_back
         self._state   = "idle"
 
-        self.last_annotated: Optional[np.ndarray] = None
-        self.last_results: List[Dict[str, Any]]   = []
+        # Estado de rastreamento: atualizado pelo _TrackingWorker a cada frame
+        self._last_detections:    List[TrackedDetection] = []
+        self._last_ghosts:        List[GhostDetection]   = []
+        # Estado de decodificação: atualizado pelo _DecodingWorker, pode ser stale
+        self._last_decode_results: List[Dict[str, Any]]  = []
 
         self._last_ts    = time.monotonic()
         self._fps_alpha  = 0.2
         self._fps_smooth = 0.0
 
-        self._worker: Optional[_AnalysisWorker]      = None
+        self._tracker:        Optional[_TrackingWorker] = None
+        self._decoder_worker: Optional[_DecodingWorker] = None
 
         self._ui_frame_mutex  = QMutex()
         self._latest_ui_frame: Optional[np.ndarray] = None
@@ -647,7 +1129,6 @@ class LiveQrView(QWidget):
         self._render_timer = QTimer(self)
         self._render_timer.timeout.connect(self._pull_and_render)
 
-        self._frame_signal.connect(self._on_analysis_done)
         self._build()
         self._build_shortcuts()
         self._set_state("idle")
@@ -740,7 +1221,7 @@ class LiveQrView(QWidget):
 
         body.addWidget(feed_wrapper, stretch=1)
 
-        self._side_panel = _SidePanel()
+        self._side_panel = _SidePanel(cam_getter=lambda: self._cam)
         body.addWidget(self._side_panel)
 
         root.addLayout(body, stretch=1)
@@ -872,10 +1353,15 @@ class LiveQrView(QWidget):
         if self._cam_subscribed:
             return
 
-        if self._worker is None or not self._worker.isRunning():
-            self._worker = _AnalysisWorker()
-            self._worker.frame_ready.connect(self._on_worker_frame)
-            self._worker.start()
+        if self._tracker is None or not self._tracker.isRunning():
+            self._tracker = _TrackingWorker()
+            self._tracker.boxes_ready.connect(self._on_tracker_boxes)
+            self._tracker.start()
+
+        if self._decoder_worker is None or not self._decoder_worker.isRunning():
+            self._decoder_worker = _DecodingWorker()
+            self._decoder_worker.decode_ready.connect(self._on_decoder_result)
+            self._decoder_worker.start()
 
         self._cam.subscribe(self._on_raw_frame)
         self._cam_subscribed = True
@@ -897,6 +1383,17 @@ class LiveQrView(QWidget):
                 self._cam.stop()
                 self._cam = None
         self._cam_subscribed = False
+
+        if self._tracker:
+            self._tracker.stop()
+            self._tracker.wait(3000)
+            self._tracker = None
+
+        if self._decoder_worker:
+            self._decoder_worker.stop()
+            self._decoder_worker.wait(3000)
+            self._decoder_worker = None
+
         self._set_state("idle")
 
     # ── Callbacks de câmera ───────────────────────────────────────────────────
@@ -904,9 +1401,9 @@ class LiveQrView(QWidget):
     def _on_raw_frame(self, frame: np.ndarray) -> None:
         if self._edges_enabled:
             frame = self._edge_enhancer.apply(frame)
-        worker = self._worker
-        if worker is not None and worker.isRunning():
-            worker.submit_frame(frame)
+        tracker = self._tracker
+        if tracker is not None and tracker.isRunning():
+            tracker.submit_frame(frame)
         with QMutexLocker(self._ui_frame_mutex):
             self._latest_ui_frame = frame.copy()
 
@@ -917,34 +1414,42 @@ class LiveQrView(QWidget):
         if frame is None:
             return
         if self._state == "opening":
-            # Primeiro frame chegou — o instrumento abre
             self._set_state("live")
         display = frame
-        if self.last_results:
-            display = _AnalysisWorker._annotate(display, self.last_results)
+        if self._last_detections or self._last_ghosts:
+            merged  = _merge_with_text(self._last_detections, self._last_decode_results)
+            display = _annotate(display, merged, self._last_ghosts)
         self._render_frame(display)
 
     # ── Slots de análise ──────────────────────────────────────────────────────
 
-    def _on_worker_frame(
-        self, annotated: np.ndarray, results: List[Dict[str, Any]]
+    def _on_tracker_boxes(
+        self,
+        detections: List[TrackedDetection],
+        ghosts: List[GhostDetection],
+        frame: np.ndarray,
     ) -> None:
-        self._frame_signal.emit(annotated, results)
-
-    def _on_analysis_done(
-        self, annotated: np.ndarray, results: List[Dict[str, Any]]
-    ) -> None:
+        """Chamado pelo _TrackingWorker a cada frame inferido (thread-safe via Qt queue)."""
         now = time.monotonic()
         instant_fps = 1.0 / max(now - self._last_ts, 1e-6)
         self._fps_smooth = (
             self._fps_alpha * instant_fps + (1 - self._fps_alpha) * self._fps_smooth
         )
-        self._last_ts   = now
-        self.last_results = results or []
+        self._last_ts         = now
+        self._last_detections = detections or []
+        self._last_ghosts     = ghosts     or []
 
-        self._side_panel.update_stats(len(results), self._fps_smooth)
+        decoder = self._decoder_worker
+        if decoder is not None and decoder.isRunning():
+            decoder.submit(frame, detections)
+
+        self._side_panel.update_stats(len(self._last_detections), self._fps_smooth)
+
+    def _on_decoder_result(self, results: List[Dict[str, Any]]) -> None:
+        """Chamado pelo _DecodingWorker quando um decode completa."""
+        self._last_decode_results = results or []
         for r in results:
-            if r["text"]:
+            if r.get("text"):
                 self._side_panel.add_detection(r["text"])
 
     # ── Renderização ──────────────────────────────────────────────────────────
@@ -1005,14 +1510,20 @@ class LiveQrView(QWidget):
                 self._cam = None
         self._cam_subscribed = False
 
-        if self._worker:
-            self._worker.stop()
-            self._worker.wait(3000)
-            self._worker = None
+        if self._tracker:
+            self._tracker.stop()
+            self._tracker.wait(3000)
+            self._tracker = None
+
+        if self._decoder_worker:
+            self._decoder_worker.stop()
+            self._decoder_worker.wait(3000)
+            self._decoder_worker = None
 
         with QMutexLocker(self._ui_frame_mutex):
             self._latest_ui_frame = None
 
-        self.last_annotated = None
-        self.last_results   = []
+        self._last_detections     = []
+        self._last_ghosts         = []
+        self._last_decode_results = []
         self._set_state("idle")
