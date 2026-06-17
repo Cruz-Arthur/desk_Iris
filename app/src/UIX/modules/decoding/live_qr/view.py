@@ -64,6 +64,7 @@ from app.src.engine.modules.decoding.live_qr.detector import Detection, IrisDete
 from app.src.engine.modules.decoding.live_qr.tracker import GhostDetection, QrTracker, TrackedDetection
 from app.src.infrastructure.video.camera import SingleCameraManager
 from app.src.infrastructure.video.enhance import EdgeEnhancer
+from app.src.infrastructure.websocket import QrWebSocketServer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1131,6 +1132,10 @@ class LiveQrView(QWidget):
 
         self._cam_subscribed = False  # rastreia subscrição, não se a câmera roda
 
+        # Servidor WebSocket — transmite QR codes decodificados para clientes externos
+        self._ws_server = QrWebSocketServer()
+        self._ws_server.start()
+
         # Timer de renderização da UI
         self._render_timer = QTimer(self)
         self._render_timer.timeout.connect(self._pull_and_render)
@@ -1458,9 +1463,14 @@ class LiveQrView(QWidget):
     def _on_decoder_result(self, results: List[Dict[str, Any]]) -> None:
         """Chamado pelo _DecodingWorker quando um decode completa."""
         self._last_decode_results = results or []
+        codes: List[str] = []
         for r in results:
-            if r.get("text"):
-                self._side_panel.add_detection(r["text"])
+            text = r.get("text")
+            if text:
+                self._side_panel.add_detection(text)
+                codes.append(text)
+        if codes:
+            self._ws_server.send(codes)
 
     # ── Renderização ──────────────────────────────────────────────────────────
 
@@ -1512,6 +1522,7 @@ class LiveQrView(QWidget):
     def _release_resources(self) -> None:
         self._render_timer.stop()
         self._feed_label.stop_scan()
+        self._ws_server.stop()
 
         if self._cam:
             self._cam.unsubscribe(self._on_raw_frame)
