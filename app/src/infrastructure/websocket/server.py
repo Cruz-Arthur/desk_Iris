@@ -9,7 +9,8 @@ Protocolo de envio:
 
 Protocolo de recepção (mensagens do cliente → servidor):
     change_separator_character: X   — troca o separador para o caractere X
-    Exemplo: change_separator_character: |
+    display_ui: True                — solicita exibição da interface gráfica
+    display_ui: False               — solicita modo headless (interface oculta)
 
 O servidor roda em thread dedicada com seu próprio event loop asyncio,
 permitindo integração sem bloqueio com o loop principal do PyQt6.
@@ -20,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-from typing import List, Optional, Set
+from typing import Any, Callable, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,12 @@ class QrWebSocketServer:
         server.stop()           # encerra o servidor
     """
 
-    def __init__(self, host: str = _DEFAULT_HOST, port: int = _DEFAULT_PORT) -> None:
+    def __init__(
+        self,
+        host: str = _DEFAULT_HOST,
+        port: int = _DEFAULT_PORT,
+        on_command: Optional[Callable[[str, Any], None]] = None,
+    ) -> None:
         self._host = host
         self._port = port
         self._separator = "#"
@@ -58,6 +64,10 @@ class QrWebSocketServer:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event: Optional[asyncio.Event] = None
+        # Callback chamado (de thread asyncio) quando comando de controle chega.
+        # Exemplo: on_command("display_ui", True)
+        # Use sinais Qt para rebridgear para a UI thread.
+        self._on_command = on_command
 
     # ── Ciclo de vida ──────────────────────────────────────────────────────────
 
@@ -135,6 +145,17 @@ class QrWebSocketServer:
                 logger.info("Separador alterado para %r", self._separator)
             else:
                 logger.warning("change_separator_character recebido sem caractere válido")
+
+        elif message.startswith("display_ui:"):
+            val = message.split(":", 1)[1].strip().lower()
+            show = val in ("true", "1", "yes")
+            logger.info("display_ui: %s", show)
+            if self._on_command:
+                try:
+                    self._on_command("display_ui", show)
+                except Exception as exc:
+                    logger.error("on_command error: %s", exc)
+
         else:
             logger.debug("Mensagem WS ignorada: %r", message)
 

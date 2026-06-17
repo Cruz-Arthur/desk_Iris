@@ -21,6 +21,7 @@ from app.src.UIX.components.shared import C, F_BODY, F_DISPLAY, GLOBAL_STYLE, Ir
 from app.src.UIX.main_menu.view import MainMenuView
 from app.src.UIX.modules.decoding.live_qr.view import LiveQrView
 from app.src.infrastructure.video.camera import SingleCameraManager
+from app.src.infrastructure.websocket import QrWebSocketServer
 
 APP_ICON_PATH = Path(__file__).resolve().parents[1] / "assets" / "img" / "logo.png"
 SVG_HEADER    = Path(__file__).resolve().parents[4] / "docs" / "header.svg"
@@ -88,7 +89,8 @@ def _build_loading_screen() -> QWidget:
 
 class MainWindow(QMainWindow):
 
-    _cam_ready_sig = pyqtSignal()   # ponte câmera-thread → UI-thread
+    _cam_ready_sig  = pyqtSignal()        # ponte câmera-thread → UI-thread
+    _ui_command_sig = pyqtSignal(str, bool)  # ponte asyncio-thread → UI-thread
 
     def __init__(self):
         super().__init__()
@@ -102,11 +104,15 @@ class MainWindow(QMainWindow):
         self._stack = QStackedWidget()
         self.setCentralWidget(self._stack)
 
-        self._live_qr_view = None
+        self._live_qr_view: LiveQrView | None = None
         self._cam: SingleCameraManager | None = None
         self._initialized    = False
         self._cam_notified   = False   # evita dismiss duplo
         self._loading_start  = 0.0     # monotonic quando _start_init rodou
+
+        # ── WebSocket server — criado aqui para sobreviver ao ciclo de vida da UI
+        self._ws_server = QrWebSocketServer(on_command=self._on_ws_command)
+        self._ws_server.start()
 
         # ── Loading screen: índice 0 (exibido por padrão pelo QStackedWidget) ─
         self._loading_widget = _build_loading_screen()
@@ -121,6 +127,7 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(0)
 
         self._cam_ready_sig.connect(self._on_cam_frame_received)
+        self._ui_command_sig.connect(self._handle_ui_command)
 
         self._cam_timeout = QTimer(self)
         self._cam_timeout.setSingleShot(True)
@@ -184,8 +191,41 @@ class MainWindow(QMainWindow):
         if iris is not None:
             iris.stop_breathing()
 
-        self._stack.setCurrentWidget(self._main_menu)
+        # Cria o LiveQrView em modo headless — workers de câmera/decode iniciam
+        # imediatamente e o WebSocket fica ativo. A janela some sem deixar rastros.
+        self._create_live_qr_headless()
         QTimer.singleShot(200, self._cleanup_loading)
+        QTimer.singleShot(400, self.hide)  # some após a loading screen sumir
+
+    def _create_live_qr_headless(self) -> None:
+        if self._live_qr_view is None:
+            self._live_qr_view = LiveQrView(
+                on_back=self._go_home,
+                camera=self._cam,
+                ws_server=self._ws_server,
+                headless=True,
+            )
+            self._stack.addWidget(self._live_qr_view)
+        # Inicia captura manualmente — showEvent não dispara em widget oculto
+        QTimer.singleShot(300, self._live_qr_view._start_capture)
+
+    # ── Comando WebSocket (display_ui) ────────────────────────────────────────
+
+    def _on_ws_command(self, name: str, value) -> None:
+        """Chamado da thread asyncio — rebridgea para UI thread via sinal Qt."""
+        if name == "display_ui":
+            self._ui_command_sig.emit(name, bool(value))
+
+    def _handle_ui_command(self, name: str, value: bool) -> None:
+        """Executa na UI thread — seguro para manipular widgets."""
+        if name == "display_ui":
+            if value:
+                self._stack.setCurrentWidget(self._main_menu)
+                self.show()
+                self.raise_()
+                self.activateWindow()
+            else:
+                self.hide()
 
     def _cleanup_loading(self) -> None:
         if self._loading_widget is not None:
@@ -250,25 +290,22 @@ class MainWindow(QMainWindow):
     # ── Navegação ─────────────────────────────────────────────────────────────
 
     def _go_home(self) -> None:
-        if self._live_qr_view:
-            self._stack.removeWidget(self._live_qr_view)
-            self._live_qr_view.deleteLater()
-            self._live_qr_view = None
+        # Em modo headless mantemos o LiveQrView vivo — não destruímos.
         self._stack.setCurrentWidget(self._main_menu)
 
     def _go_live_qr(self) -> None:
-        if not self._live_qr_view:
-            QTimer.singleShot(0, self._create_and_open_live_qr)
-            return
-        self._stack.setCurrentWidget(self._live_qr_view)
-
-    def _create_and_open_live_qr(self) -> None:
-        if not self._live_qr_view:
-            self._live_qr_view = LiveQrView(on_back=self._go_home, camera=self._cam)
+        if self._live_qr_view is None:
+            self._live_qr_view = LiveQrView(
+                on_back=self._go_home,
+                camera=self._cam,
+                ws_server=self._ws_server,
+                headless=True,
+            )
             self._stack.addWidget(self._live_qr_view)
         self._stack.setCurrentWidget(self._live_qr_view)
 
     def closeEvent(self, event) -> None:
+        self._ws_server.stop()
         if self._cam:
             self._cam.stop()
             self._cam = None
@@ -280,6 +317,8 @@ def main():
     app.setOrganizationName("Iris")
     app.setApplicationName("Iris")
     app.setStyle("Fusion")
+    # Impede que o app encerre ao esconder a janela principal (modo headless).
+    app.setQuitOnLastWindowClosed(False)
     if APP_ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     window = MainWindow()

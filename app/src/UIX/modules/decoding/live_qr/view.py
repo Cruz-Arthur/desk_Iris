@@ -1097,10 +1097,13 @@ class LiveQrView(QWidget):
         "live":    "AO VIVO",
     }
 
-    def __init__(self, on_back=None, camera=None, parent=None) -> None:
+    def __init__(self, on_back=None, camera=None, ws_server=None, headless: bool = False, parent=None) -> None:
         super().__init__(parent)
-        self._on_back = on_back
-        self._state   = "idle"
+        self._on_back  = on_back
+        self._state    = "idle"
+        # Em modo headless os workers continuam rodando mesmo quando o widget
+        # fica oculto (ex: usuário navega para o menu principal ou janela esconde).
+        self._headless = headless
 
         # Estado de rastreamento: atualizado pelo _TrackingWorker a cada frame
         self._last_detections:    List[TrackedDetection] = []
@@ -1132,9 +1135,12 @@ class LiveQrView(QWidget):
 
         self._cam_subscribed = False  # rastreia subscrição, não se a câmera roda
 
-        # Servidor WebSocket — transmite QR codes decodificados para clientes externos
-        self._ws_server = QrWebSocketServer()
-        self._ws_server.start()
+        # Servidor WebSocket — usa o servidor externo se fornecido (MainWindow),
+        # caso contrário cria e gerencia o próprio.
+        self._ws_owned = ws_server is None
+        self._ws_server = ws_server if ws_server is not None else QrWebSocketServer()
+        if self._ws_owned:
+            self._ws_server.start()
 
         # Timer de renderização da UI
         self._render_timer = QTimer(self)
@@ -1502,12 +1508,15 @@ class LiveQrView(QWidget):
     # ── Ciclo de vida do widget ───────────────────────────────────────────────
 
     def _handle_back(self) -> None:
-        self._release_resources()
+        if not self._headless:
+            self._release_resources()
         if self._on_back:
             self._on_back()
 
     def hideEvent(self, event) -> None:
-        self._release_resources()
+        # Em modo headless os workers continuam vivos — apenas a janela some.
+        if not self._headless:
+            self._release_resources()
         super().hideEvent(event)
 
     def closeEvent(self, event) -> None:
@@ -1522,7 +1531,8 @@ class LiveQrView(QWidget):
     def _release_resources(self) -> None:
         self._render_timer.stop()
         self._feed_label.stop_scan()
-        self._ws_server.stop()
+        if self._ws_owned:
+            self._ws_server.stop()
 
         if self._cam:
             self._cam.unsubscribe(self._on_raw_frame)
