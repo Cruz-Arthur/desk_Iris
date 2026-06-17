@@ -34,8 +34,7 @@ def main() -> None:
         session = ort.InferenceSession(model_path, sess_options=opts, providers=providers)
         del session
 
-    except Exception as exc:
-        print(f"[DML-WARMUP] erro: {exc}", file=sys.stderr)
+    except Exception:
         sys.exit(1)
 
     sys.exit(0)

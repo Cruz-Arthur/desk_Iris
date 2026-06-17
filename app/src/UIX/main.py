@@ -5,7 +5,6 @@ from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon
-from PyQt6.QtSvgWidgets import QSvgWidget
 from PyQt6.QtWidgets import (
     QApplication, QLabel, QMainWindow, QSizePolicy,
     QStackedWidget, QVBoxLayout, QWidget,
@@ -23,8 +22,9 @@ from app.src.UIX.modules.decoding.live_qr.view import LiveQrView
 from app.src.infrastructure.video.camera import SingleCameraManager
 from app.src.infrastructure.websocket import QrWebSocketServer
 
-APP_ICON_PATH = Path(__file__).resolve().parents[1] / "assets" / "img" / "logo.png"
-SVG_HEADER    = Path(__file__).resolve().parents[4] / "docs" / "header.svg"
+from app.src.utils.paths import ASSETS_DIR as _ASSETS_DIR, DOCS_DIR as _DOCS_DIR
+APP_ICON_PATH = _ASSETS_DIR / "img" / "logo.png"
+SVG_HEADER    = _DOCS_DIR / "header.svg"
 
 _LOADING_MIN_MS  = 1_000   # tempo mínimo de exibição da loading screen
 _CAM_TIMEOUT_MS  = 6_000   # fallback: prossegue mesmo sem câmera
@@ -48,20 +48,21 @@ def _build_loading_screen() -> QWidget:
     vl.setSpacing(0)
     vl.setContentsMargins(0, 32, 0, 32)
 
-    # ── SVG do README ─────────────────────────────────────────────────────────
-    # Qt renderiza SVG estático (sem suporte a animações SMIL).
-    # A animação visual fica por conta da IrisAperture abaixo.
-    if SVG_HEADER.exists():
-        svg = QSvgWidget(str(SVG_HEADER))
-        # Preserva proporção 900:400 e expande com a janela
-        svg.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        svg.setMinimumWidth(400)
-        svg.setFixedHeight(320)  # ≈ 900×400 escalado para caber na tela
-        svg.setStyleSheet("background: transparent;")
-        vl.addWidget(svg)
-        vl.addSpacing(28)
+    # ── Logo PNG ──────────────────────────────────────────────────────────────
+    if APP_ICON_PATH.exists():
+        from PyQt6.QtGui import QPixmap
+        logo = QLabel()
+        pix = QPixmap(str(APP_ICON_PATH)).scaled(
+            120, 120,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        logo.setPixmap(pix)
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setStyleSheet("background: transparent;")
+        vl.addWidget(logo)
+        vl.addSpacing(24)
     else:
-        # Fallback se SVG não existir: só a íris grande
         vl.addSpacing(40)
 
     # ── Íris respirando — único elemento animado (sinal de atividade) ─────────
@@ -253,9 +254,9 @@ class MainWindow(QMainWindow):
             _DEFAULT_MODEL_PATH,
         )
 
+        from app.src.utils.paths import APP_ROOT as _APP_ROOT
         warmup_script = (
-            Path(__file__).resolve().parents[1]
-            / "engine" / "modules" / "decoding" / "live_qr" / "_dml_warmup.py"
+            _APP_ROOT / "app" / "src" / "engine" / "modules" / "decoding" / "live_qr" / "_dml_warmup.py"
         )
 
         # ── Passo 1: subprocesso aquece cache D3D12 em disco ─────────────────
@@ -268,24 +269,21 @@ class MainWindow(QMainWindow):
                     timeout=90,
                 )
                 if result.returncode == 0:
-                    print("[WARMUP] Subprocesso DML concluído — cache em disco pronto")
+                    pass
                 else:
-                    print("[WARMUP] Subprocesso DML encerrou com erro (continuando)")
+                    pass
             except subprocess.TimeoutExpired:
-                print("[WARMUP] Subprocesso DML excedeu timeout")
-            except Exception as exc:
-                print(f"[WARMUP] Subprocesso DML falhou: {exc}")
-        else:
-            print(f"[WARMUP] Script não encontrado: {warmup_script}")
+                pass
+            except Exception:
+                pass
 
         # ── Passo 2: sessão no processo principal via cache de disco ──────────
         # D3D12 já está aquecido → criação rápida, sem compilação, sem freeze
         try:
             from app.src.engine.modules.decoding.live_qr.detector import IrisDetector  # noqa: PLC0415
             IrisDetector()
-            print("[WARMUP] IrisDetector pronto — sessão em cache de memória")
-        except Exception as exc:
-            print(f"[WARMUP] IrisDetector falhou: {exc}")
+        except Exception:
+            pass
 
     # ── Navegação ─────────────────────────────────────────────────────────────
 

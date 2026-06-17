@@ -199,7 +199,6 @@ def _open_camera(
         try:
             cap = cv2.VideoCapture(index, cached_id)
             if cap and cap.isOpened():
-                print(f"[CAM {index}] Cache hit → {cached_name}")
                 return cap, cached_name
         except Exception:
             pass
@@ -210,7 +209,6 @@ def _open_camera(
                 pass
         # Stale cache entry — clear and fall through to full probe
         del _backend_cache[index]
-        print(f"[CAM {index}] Cache stale, re-probing")
 
     # ── Full probe: DSHOW first, then MSMF, then ANY as last resort ──────────
     attempts = backend_order or [
@@ -225,7 +223,6 @@ def _open_camera(
             cap = cv2.VideoCapture(index, backend_id)
             if cap and cap.isOpened():
                 _backend_cache[index] = (name, backend_id)
-                print(f"[CAM {index}] Opened via {name}")
                 return cap, name
         except Exception:
             pass
@@ -340,8 +337,6 @@ class SingleCameraManager:
         on self._init_done (internal) or simply subscribe and wait for the
         first frame callback — the existing contract for all consumers.
         """
-        print(f"[CAM {self._index}] Iniciando (async)...")
-
         self._stop_event.clear()
         self._init_done.clear()
         self._new_frame_event.clear()
@@ -396,7 +391,6 @@ class SingleCameraManager:
             cap, backend = _open_camera(self._index, self._backend_order)
 
             if cap is None or not cap.isOpened():
-                print(f"[CAM {self._index}] Init failed: no backend responded")
                 self._running = False
                 return
 
@@ -431,7 +425,6 @@ class SingleCameraManager:
                 for _ in range(self._warmup_frames):
                     cap.read()
 
-            print(f"[CAM {self._index}] Pronta  {actual_w}×{actual_h}  [{self._backend}]")
 
             # ── Atomically publish cap + flush pending properties ──────────
             with self._props_lock:
@@ -462,8 +455,7 @@ class SingleCameraManager:
             self._capture_thread.start()
             self._dispatch_thread.start()
 
-        except Exception as exc:
-            print(f"[CAM {self._index}] Init error: {exc}")
+        except Exception:
             if cap:
                 try:
                     cap.release()
@@ -480,8 +472,6 @@ class SingleCameraManager:
     # =====================================================
 
     def stop(self):
-        print(f"[CAM {self._index}] Parando...")
-
         self._stop_event.set()
         self._new_frame_event.set()  # unblock dispatch loop if waiting
         self._init_done.set()        # unblock any waiter if init is mid-flight
@@ -579,7 +569,6 @@ class SingleCameraManager:
                 consecutive_failures += 1
 
                 if consecutive_failures > 10:
-                    print(f"[CAM {self._index}] SEM SINAL")
                     break
 
                 time.sleep(0.05)
@@ -864,8 +853,7 @@ class MultiCameraManager:
         """
         try:
             cameras = discover_cameras()
-        except Exception as exc:
-            print(f"[DISCOVERY] falha ao listar câmeras: {exc}")
+        except Exception:
             cameras = []
 
         by_index = {cam.get("index"): cam for cam in cameras}
@@ -882,11 +870,9 @@ class MultiCameraManager:
                 occurrence = int(cam.get("label_occurrence") or 1)
                 self._target_camera_labels[name] = label
                 self._target_camera_signatures[name] = (label, occurrence)
-                print(f"[DISCOVERY] {name}: alvo '{label}' #{occurrence} no idx {index}")
             else:
                 self._target_camera_labels[name] = None
                 self._target_camera_signatures[name] = None
-                print(f"[DISCOVERY] {name}: não encontrou label inicial para idx {index}")
 
     def _get_used_indexes_except(self, name: str) -> set[int]:
         """
@@ -928,11 +914,9 @@ class MultiCameraManager:
         try:
             cameras = discover_cameras()
         except Exception as exc:
-            print(f"[DISCOVERY] {name}: erro no discover_cameras -> {exc}")
             return None
 
         if not cameras:
-            print(f"[DISCOVERY] {name}: nenhuma câmera encontrada")
             return None
 
         target_label = self._target_camera_labels.get(name)
@@ -952,17 +936,12 @@ class MultiCameraManager:
                     and cam_occurrence == target_occurrence
                     and cam_index not in used_indexes
                 ):
-                    print(
-                        f"[DISCOVERY] {name}: assinatura '{target_name}' "
-                        f"#{target_occurrence} encontrada no idx {cam_index}"
-                    )
                     return cam_index
 
         # 2. tenta indice antigo, desde que nao esteja sendo usado por outro slot ativo
         if old_index is not None and old_index not in used_indexes:
             for cam in cameras:
                 if cam.get("index") == old_index:
-                    print(f"[DISCOVERY] {name}: indice antigo {old_index} ainda disponivel")
                     return old_index
 
         # 3. fallback: tenta encontrar pela mesma label sem roubar indice ativo
@@ -972,15 +951,8 @@ class MultiCameraManager:
                 cam_label = cam.get("label")
 
                 if cam_label == target_label and cam_index not in used_indexes:
-                    print(
-                        f"[DISCOVERY] {name}: label '{target_label}' encontrada no idx {cam_index}"
-                    )
                     return cam_index
 
-        print(
-            f"[DISCOVERY] {name}: nenhum índice compatível. "
-            f"Usados por outras câmeras: {sorted(used_indexes)}"
-        )
         return None
 
     # =====================================================
@@ -1005,10 +977,7 @@ class MultiCameraManager:
         index = self._indexes[name]
 
         if index is None:
-            print(f"[START_SAFE] {name}: índice nulo")
             return
-
-        print(f"[START_SAFE] {name}: tentando abrir índice {index}")
 
         try:
             manager = SingleCameraManager(camera_index=index)
@@ -1027,11 +996,8 @@ class MultiCameraManager:
             state.is_reconnecting = False
 
             self._set_status(name, "◌ Aberta, aguardando frames", "loading")
-            print(f"[START_SAFE] {name}: iniciada com sucesso idx {index}")
 
-        except Exception as exc:
-            print(f"[START_SAFE] {name}: falha ao abrir idx {index} -> {exc}")
-
+        except Exception:
             self._managers[name] = None
 
             state = self._states[name]
@@ -1096,7 +1062,6 @@ class MultiCameraManager:
                     elapsed = now - state.opened_ts
 
                     if elapsed > self.NO_FRAME_TIMEOUT_S:
-                        print(f"[WATCHDOG] {name}: sem frames iniciais há {elapsed:.2f}s")
                         self._set_status(name, "⚠ Sem frames iniciais", "warning")
                         self._dispose_camera(name)
                         self._schedule_reconnect(name)
@@ -1108,7 +1073,6 @@ class MultiCameraManager:
                     elapsed = now - state.last_frame_ts
 
                     if elapsed > self.NO_FRAME_TIMEOUT_S:
-                        print(f"[WATCHDOG] {name}: perda de sinal detectada ({elapsed:.2f}s)")
                         self._set_status(name, "⚠ Perda de sinal", "warning")
                         self._dispose_camera(name)
                         self._schedule_reconnect(name)
@@ -1120,11 +1084,9 @@ class MultiCameraManager:
         state = self._states[name]
 
         if state.is_reconnecting:
-            print(f"[RECONNECT] {name}: já reconectando")
             return
 
         if state.reconnect_attempts >= state.max_reconnect_attempts:
-            print(f"[RECONNECT] {name}: limite atingido")
             self._set_status(name, "✖ Falha permanente", "danger")
             return
 
@@ -1142,8 +1104,6 @@ class MultiCameraManager:
             "warning",
         )
 
-        print(f"[RECONNECT] {name}: agendado em {delay:.1f}s")
-
         threading.Thread(
             target=self._reconnect_after_delay,
             args=(name, delay),
@@ -1156,13 +1116,11 @@ class MultiCameraManager:
         time.sleep(delay)
 
         if self._stop_event.is_set():
-            print(f"[RECONNECT] {name}: cancelado por stop")
             return
 
         new_index = self._resolve_reconnect_index(name)
 
         if new_index is None:
-            print(f"[RECONNECT] {name}: câmera ainda não reapareceu")
             self._set_status(name, "⌛ Aguardando retorno da câmera", "warning")
 
             state = self._states[name]
@@ -1174,21 +1132,16 @@ class MultiCameraManager:
         self._indexes[name] = new_index
         self._states[name].index = new_index
 
-        if old_index != new_index:
-            print(f"[RECONNECT] {name}: índice atualizado {old_index} -> {new_index}")
-
         self._set_status(name, "↻ Reabrindo câmera", "loading")
         self._start_camera_safe(name)
 
     def _dispose_camera(self, name: str) -> None:
-        print(f"[DISPOSE] {name}: liberando câmera")
-
         manager = self._managers[name]
         if manager:
             try:
                 manager.stop()
-            except Exception as exc:
-                print(f"[DISPOSE] {name}: erro ao parar -> {exc}")
+            except Exception:
+                pass
 
         self._managers[name] = None
 

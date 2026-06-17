@@ -63,7 +63,8 @@ F_DISPLAY = "'Bahnschrift', 'Segoe UI', sans-serif"
 F_BODY    = "'Segoe UI', sans-serif"
 F_DATA    = "'Consolas', 'Courier New', monospace"
 
-APP_LOGO_PATH = Path(__file__).resolve().parents[2] / "assets" / "img" / "logo.png"
+from app.src.utils.paths import ASSETS_DIR as _ASSETS_DIR
+APP_LOGO_PATH = _ASSETS_DIR / "img" / "logo.png"
 
 GLOBAL_STYLE = f"""
     QWidget {{

@@ -302,8 +302,8 @@ class _TrackingWorker(QThread):
                 detections      = self._engine.detect(frame)
                 tracked, ghosts = qr_tracker.update(detections)
                 self.boxes_ready.emit(tracked, ghosts, frame)
-            except Exception as exc:
-                print(f"[Tracker] {exc}")
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -364,8 +364,8 @@ class _DecodingWorker(QThread):
                     for d, (text, _, _, _) in zip(detections, decoded)
                 ]
                 self.decode_ready.emit(results)
-            except Exception as exc:
-                print(f"[Decoder] {exc}")
+            except Exception:
+                pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -777,17 +777,79 @@ class _CameraControls(QFrame):
         reset_btn.clicked.connect(self._reset_all)
         root.addWidget(reset_btn)
 
+    # ── persistência ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _settings_path() -> "Path":
+        import os
+        from pathlib import Path
+        base = Path(os.environ.get("APPDATA") or Path.home())
+        p = base / "Iris" / "camera_settings.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+
+    def _save(self) -> None:
+        import json
+        data: dict = {"props": {}, "auto": {}}
+        for row in self._rows:
+            data["props"][str(row.prop_id)] = float(row._slider.value())
+            if row._auto_info:
+                auto_prop_id, auto_on, auto_off = row._auto_info
+                data["auto"][str(auto_prop_id)] = float(auto_on if row._is_auto else auto_off)
+        try:
+            self._settings_path().write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def load_and_apply(self) -> None:
+        """Lê configurações salvas e aplica na câmera + sliders."""
+        import json
+        path = self._settings_path()
+        if not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        cam = self._cam_getter()
+        props = data.get("props", {})
+        autos = data.get("auto", {})
+
+        for row in self._rows:
+            # Auto mode primeiro
+            if row._auto_info:
+                auto_prop_id, auto_on, _ = row._auto_info
+                saved_auto = autos.get(str(auto_prop_id))
+                if saved_auto is not None:
+                    is_auto = (int(round(saved_auto)) == auto_on)
+                    if is_auto != row._is_auto:
+                        row._auto_btn.setChecked(is_auto)
+                        row._on_auto_toggled(is_auto)
+                    if cam is not None:
+                        cam.set_property(auto_prop_id, float(saved_auto))
+            # Valor numérico
+            saved_val = props.get(str(row.prop_id))
+            if saved_val is not None:
+                v = float(saved_val)
+                if row._lo <= v <= row._hi:
+                    row.set_value(v)
+                    if cam is not None:
+                        cam.set_property(row.prop_id, v)
+
     # ── slots ─────────────────────────────────────────────────────────────────
 
     def _on_prop(self, prop_id: int, value: float) -> None:
         cam = self._cam_getter()
         if cam is not None:
             cam.set_property(prop_id, value)
+        self._save()
 
     def _on_auto(self, auto_prop_id: int, value: float) -> None:
         cam = self._cam_getter()
         if cam is not None:
             cam.set_property(auto_prop_id, value)
+        self._save()
 
     def sync_from_camera(self) -> None:
         """Lê valores actuais do driver e atualiza todos os sliders."""
@@ -812,6 +874,7 @@ class _CameraControls(QFrame):
     def _reset_all(self) -> None:
         for row in self._rows:
             row.reset_to_default()
+        self._save()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1382,6 +1445,10 @@ class LiveQrView(QWidget):
 
         self._cam.subscribe(self._on_raw_frame)
         self._cam_subscribed = True
+
+        # Aplica configurações salvas assim que a câmera está subscrita
+        if hasattr(self, "_side_panel") and hasattr(self._side_panel, "_cam_controls"):
+            self._side_panel._cam_controls.load_and_apply()
 
         # O feed só aparece quando o primeiro frame chegar (_pull_and_render);
         # até lá o overlay "ABRINDO CÂMERA" conta a verdade — sem tela preta.

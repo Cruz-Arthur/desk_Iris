@@ -58,9 +58,8 @@ _DEFAULT_IMG_SIZE   = 640
 _DEFAULT_CONF_THRES = 0.51
 _DEFAULT_IOU_THRES  = 0.45
 
-_DEFAULT_MODEL_PATH = Path(__file__).resolve().parents[4] / (
-    "models/live_qr_yolo/train/weights/best.onnx"
-)
+from app.src.utils.paths import MODELS_DIR as _MODELS_DIR
+_DEFAULT_MODEL_PATH = _MODELS_DIR / "live_qr_yolo" / "train" / "weights" / "best.onnx"
 
 
 # ---------------------------------------------------------------------------

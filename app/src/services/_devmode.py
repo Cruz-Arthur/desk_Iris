@@ -20,4 +20,4 @@ import os
 DEV_MODE: bool = os.getenv("IRIS_DEVMODE", "0").strip() == "1"
 
 if DEV_MODE:
-    print("[IRIS_DEVMODE] ⚠  Modo desenvolvimento ativo — dados NÃO são enviados ao banco.")
+    pass
