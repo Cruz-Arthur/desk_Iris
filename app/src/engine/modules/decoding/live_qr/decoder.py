@@ -211,10 +211,8 @@ class QrDecoder:
         x, y, w, h = cv2.boundingRect(pts.astype(np.int32))
         anchor = (x, y, w, h)
 
-        # Crop normal (padding 24) e crop generoso (padding 48) para não cortar
-        # finder patterns em detecções com bbox apertada
+        # Crop normal (padding 24) — caso mais comum; crop_wide só computa se falhar.
         crop_norm, ox, oy = crop_with_padding(frame, anchor, padding=24)
-        crop_wide, _,  _  = crop_with_padding(frame, anchor, padding=48)
 
         if crop_norm.size == 0:
             return None, None, ox, oy
@@ -224,7 +222,8 @@ class QrDecoder:
         if result:
             return result, crop_norm, ox, oy
 
-        # Tenta crop mais generoso antes de entrar no pipeline de preprocessing
+        # Crop generoso (padding 48) — lazy: só se norm falhou
+        crop_wide, _, _ = crop_with_padding(frame, anchor, padding=48)
         if crop_wide.size > 0 and crop_wide.shape != crop_norm.shape:
             result = self._try_all_decoders(crop_wide)
             if result:
@@ -244,21 +243,26 @@ class QrDecoder:
 
     def _try_all_decoders(self, img: np.ndarray) -> Optional[str]:
         """
-        Tenta todos os decoders sobre a mesma imagem. Gray convertido uma vez.
+        Tenta todos os decoders sobre a mesma imagem.
 
         Ordem otimizada para leitura em movimento:
-          1. zxing-cpp — GIL-releasing, batch API, melhor hit-rate (se disponível)
+          1. zxing-cpp — aceita BGR direto (binarização interna), GIL-releasing
           2. pyzbar    — ZBar clássico, fallback quando zxing não instalado
           3. cv2       — fallback secundário
           4. Aruco     — lento, robusto para perspectiva/dano (último recurso)
-        """
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
 
+        gray só é computado se zxing não estiver disponível (pyzbar/cv2/aruco
+        requerem gray). Evita cvtColor desnecessário no caminho quente.
+        """
         if _ZXING_AVAILABLE:
-            result = self._run_zxing(gray)
+            result = self._run_zxing(img)   # zxing aceita BGR ou gray
             if result:
                 return result
-        else:
+
+        # Gray compartilhado pelos decoders restantes — convertido uma única vez.
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+
+        if not _ZXING_AVAILABLE:
             result = self._run_pyzbar(gray)
             if result:
                 return result

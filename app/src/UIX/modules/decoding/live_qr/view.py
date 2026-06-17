@@ -1452,10 +1452,12 @@ class LiveQrView(QWidget):
 
         # O feed só aparece quando o primeiro frame chegar (_pull_and_render);
         # até lá o overlay "ABRINDO CÂMERA" conta a verdade — sem tela preta.
+        # Em modo headless não há nada a renderizar — o timer só desperdiça CPU.
         self._set_state("opening")
         self._last_ts = time.monotonic()
-        self._render_timer.start(_RENDER_INTERVAL_MS)
-        self._feed_label.start_scan()
+        if not self._headless:
+            self._render_timer.start(_RENDER_INTERVAL_MS)
+            self._feed_label.start_scan()
 
     def _stop_capture(self) -> None:
         self._render_timer.stop()
@@ -1483,17 +1485,19 @@ class LiveQrView(QWidget):
     # ── Callbacks de câmera ───────────────────────────────────────────────────
 
     def _on_raw_frame(self, frame: np.ndarray) -> None:
-        # One copy early — shared between tracker and UI render.
-        # Edge enhancer already creates a new array; only copy when edges are off.
+        # Headless sem render ativo: tracker não precisa de buffer próprio pois a
+        # câmera não reutiliza o array entre callbacks — passa direto, sem cópia.
+        render_active = self._render_timer.isActive()
         if self._edges_enabled:
-            frame = self._edge_enhancer.apply(frame)
-        else:
-            frame = frame.copy()
+            frame = self._edge_enhancer.apply(frame)  # nova array — cópia implícita
+        elif render_active:
+            frame = frame.copy()   # isola buffer compartilhado com o render timer
         tracker = self._tracker
         if tracker is not None and tracker.isRunning():
             tracker.submit_frame(frame)
-        with QMutexLocker(self._ui_frame_mutex):
-            self._latest_ui_frame = frame   # no extra copy — same owned buffer
+        if render_active:
+            with QMutexLocker(self._ui_frame_mutex):
+                self._latest_ui_frame = frame   # no extra copy — same owned buffer
 
     def _pull_and_render(self) -> None:
         with QMutexLocker(self._ui_frame_mutex):
@@ -1594,6 +1598,17 @@ class LiveQrView(QWidget):
         super().showEvent(event)
         # Auto-inicia: o operador não deveria precisar clicar para trabalhar.
         QTimer.singleShot(300, self._start_capture)
+
+    def enable_render(self) -> None:
+        """Liga o render timer (chamado ao mostrar a janela em modo headless)."""
+        if not self._render_timer.isActive() and self._cam_subscribed:
+            self._render_timer.start(_RENDER_INTERVAL_MS)
+            self._feed_label.start_scan()
+
+    def disable_render(self) -> None:
+        """Desliga o render timer sem parar workers (chamado ao esconder em modo headless)."""
+        self._render_timer.stop()
+        self._feed_label.stop_scan()
 
     def _release_resources(self) -> None:
         self._render_timer.stop()

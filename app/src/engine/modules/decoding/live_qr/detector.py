@@ -138,9 +138,10 @@ class IrisDetector:
         opts = ort.SessionOptions()
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         opts.execution_mode           = ort.ExecutionMode.ORT_SEQUENTIAL
-        # Physical cores only — hyperthreads hurt throughput for single-model inference
+        # Physical cores only — hyperthreads hurt throughput for single-model inference.
+        # No artificial cap: let ORT use all physical cores available on the machine.
         _phys = max(1, (os.cpu_count() or 2) // 2)
-        opts.intra_op_num_threads = min(_phys, 4)
+        opts.intra_op_num_threads = _phys
         opts.inter_op_num_threads = 1
         opts.enable_mem_pattern   = True   # reuse allocations for fixed-shape inputs
         opts.enable_cpu_mem_arena = True   # pre-allocate memory arena at session init

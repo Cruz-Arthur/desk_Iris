@@ -351,21 +351,39 @@ class QrTracker:
         assignments: Dict[int, int] = {}
 
         if nd and nt:
-            det_cxs = np.array([(d.x1 + d.x2) / 2.0 for d in detections], dtype=np.float64)
-            det_cys = np.array([(d.y1 + d.y2) / 2.0 for d in detections], dtype=np.float64)
-            pred_xs = np.array([predictions[tid][0]    for tid in track_ids], dtype=np.float64)
-            pred_ys = np.array([predictions[tid][1]    for tid in track_ids], dtype=np.float64)
-            last_xs = np.array([last_positions[tid][0] for tid in track_ids], dtype=np.float64)
-            last_ys = np.array([last_positions[tid][1] for tid in track_ids], dtype=np.float64)
-            dist_m  = _dist_matrix_nb(det_cxs, det_cys, pred_xs, pred_ys, last_xs, last_ys)
-
-            # Greedy: sort by distance, assign closest pairs within dynamic gate
-            candidates = [
-                (dist_m[i, j], i, j)
-                for i in range(nd)
-                for j, tid in enumerate(track_ids)
-                if dist_m[i, j] < self._tracks[tid].gate_radius()
-            ]
+            # Para casos comuns (≤4 QRs simultâneos) o overhead de alocar 6 arrays
+            # numpy + marshalling Numba supera o ganho. Python puro é mais rápido.
+            # Numba compensa apenas para nd×nt grandes (>16 combinações).
+            candidates: list = []
+            if _NUMBA_AVAILABLE and nd * nt > 16:
+                det_cxs = np.array([(d.x1 + d.x2) / 2.0 for d in detections], dtype=np.float64)
+                det_cys = np.array([(d.y1 + d.y2) / 2.0 for d in detections], dtype=np.float64)
+                pred_xs = np.array([predictions[tid][0]    for tid in track_ids], dtype=np.float64)
+                pred_ys = np.array([predictions[tid][1]    for tid in track_ids], dtype=np.float64)
+                last_xs = np.array([last_positions[tid][0] for tid in track_ids], dtype=np.float64)
+                last_ys = np.array([last_positions[tid][1] for tid in track_ids], dtype=np.float64)
+                dist_m  = _dist_matrix_nb(det_cxs, det_cys, pred_xs, pred_ys, last_xs, last_ys)
+                candidates = [
+                    (dist_m[i, j], i, j)
+                    for i in range(nd)
+                    for j, tid in enumerate(track_ids)
+                    if dist_m[i, j] < self._tracks[tid].gate_radius()
+                ]
+            else:
+                # Python puro — sem alloc numpy, sem marshalling
+                for i, det in enumerate(detections):
+                    dcx = (det.x1 + det.x2) * 0.5
+                    dcy = (det.y1 + det.y2) * 0.5
+                    for j, tid in enumerate(track_ids):
+                        px, py = predictions[tid]
+                        lx, ly = last_positions[tid]
+                        dpx = dcx - px; dpy = dcy - py
+                        dlx = dcx - lx; dly = dcy - ly
+                        d_pred = (dpx * dpx + dpy * dpy) ** 0.5
+                        d_last = (dlx * dlx + dly * dly) ** 0.5
+                        dist   = d_pred if d_pred < d_last else d_last
+                        if dist < self._tracks[tid].gate_radius():
+                            candidates.append((dist, i, j))
             candidates.sort()
 
             matched_d: set[int] = set()

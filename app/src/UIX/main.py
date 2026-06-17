@@ -225,7 +225,11 @@ class MainWindow(QMainWindow):
                 self.show()
                 self.raise_()
                 self.activateWindow()
+                if self._live_qr_view is not None:
+                    self._live_qr_view.enable_render()
             else:
+                if self._live_qr_view is not None:
+                    self._live_qr_view.disable_render()
                 self.hide()
 
     def _cleanup_loading(self) -> None:
