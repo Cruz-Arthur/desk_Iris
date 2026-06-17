@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 from typing import Any, Callable, List, Optional, Set
 
@@ -56,6 +57,7 @@ class QrWebSocketServer:
         host: str = _DEFAULT_HOST,
         port: int = _DEFAULT_PORT,
         on_command: Optional[Callable[[str, Any], None]] = None,
+        exit_on_disconnect: bool = False,
     ) -> None:
         self._host = host
         self._port = port
@@ -68,6 +70,10 @@ class QrWebSocketServer:
         # Exemplo: on_command("display_ui", True)
         # Use sinais Qt para rebridgear para a UI thread.
         self._on_command = on_command
+        # Quando True, encerra o processo imediatamente ao ficar sem clientes.
+        self._exit_on_disconnect = exit_on_disconnect
+        # Só conta após o primeiro cliente ter conectado — não termina na subida.
+        self._had_client = False
 
     # ── Ciclo de vida ──────────────────────────────────────────────────────────
 
@@ -127,6 +133,7 @@ class QrWebSocketServer:
 
     async def _handler(self, ws: "WebSocketServerProtocol") -> None:
         self._clients.add(ws)
+        self._had_client = True
         logger.info("Cliente WS conectado: %s", ws.remote_address)
         try:
             async for message in ws:
@@ -136,6 +143,9 @@ class QrWebSocketServer:
         finally:
             self._clients.discard(ws)
             logger.info("Cliente WS desconectado: %s", ws.remote_address)
+            if self._exit_on_disconnect and self._had_client and not self._clients:
+                logger.info("Último cliente desconectou — encerrando processo.")
+                os._exit(0)
 
     def _process_incoming(self, message: str) -> None:
         if message.startswith("change_separator_character:"):

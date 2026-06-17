@@ -112,7 +112,10 @@ class MainWindow(QMainWindow):
         self._loading_start  = 0.0     # monotonic quando _start_init rodou
 
         # ── WebSocket server — criado aqui para sobreviver ao ciclo de vida da UI
-        self._ws_server = QrWebSocketServer(on_command=self._on_ws_command)
+        self._ws_server = QrWebSocketServer(
+            on_command=self._on_ws_command,
+            exit_on_disconnect=True,
+        )
         self._ws_server.start()
 
         # ── Loading screen: índice 0 (exibido por padrão pelo QStackedWidget) ─
@@ -263,8 +266,14 @@ class MainWindow(QMainWindow):
             _APP_ROOT / "app" / "src" / "engine" / "modules" / "decoding" / "live_qr" / "_dml_warmup.py"
         )
 
+        # Em app frozen (PyInstaller onefile) sys.executable é o próprio Iris.exe,
+        # não um interpretador Python — relançá-lo dispararia outra instância
+        # (barrada pelo mutex) em vez de aquecer o cache. Pula direto para o
+        # passo 2, criando a sessão no próprio processo.
+        _frozen = getattr(sys, "frozen", False)
+
         # ── Passo 1: subprocesso aquece cache D3D12 em disco ─────────────────
-        if warmup_script.exists():
+        if not _frozen and warmup_script.exists():
             try:
                 result = subprocess.run(
                     [sys.executable, str(warmup_script), str(_DEFAULT_MODEL_PATH)],

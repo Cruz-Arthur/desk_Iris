@@ -1,9 +1,16 @@
 """
 utils/paths.py
 --------------
-Resolução de paths que funciona tanto em desenvolvimento quanto em app frozen
-(cx_Freeze, Nuitka). Em modo frozen sys.frozen=True e sys.executable aponta
-para o EXE — usamos ele como âncora no lugar de __file__.
+Resolução de paths que funciona em desenvolvimento e em app frozen
+(PyInstaller, cx_Freeze, Nuitka).
+
+Modos frozen:
+  • PyInstaller onefile  — os dados (--add-data) são extraídos para uma pasta
+    temporária em sys._MEIPASS; o EXE NÃO fica ao lado deles.
+  • PyInstaller onedir / cx_Freeze / Nuitka — os dados ficam ao lado do EXE.
+
+Por isso, em frozen, priorizamos sys._MEIPASS quando existir; caso contrário
+usamos a pasta do executável.
 """
 
 from __future__ import annotations
@@ -14,7 +21,11 @@ from pathlib import Path
 
 def _root() -> Path:
     if getattr(sys, "frozen", False):
-        # Frozen: EXE está na raiz da pasta de distribuição
+        # PyInstaller onefile: dados extraídos para sys._MEIPASS
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+        # cx_Freeze / Nuitka / PyInstaller onedir: dados ao lado do EXE
         return Path(sys.executable).resolve().parent
     # Dev: sobe de app/src/utils/ → app/src/ → app/ → repo root
     return Path(__file__).resolve().parents[3]
