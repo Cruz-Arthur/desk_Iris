@@ -15,6 +15,7 @@ usamos a pasta do executável.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -31,7 +32,22 @@ def _root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def _config_dir() -> Path:
+    """
+    Diretório gravável e estável entre execuções para settings do usuário.
+
+    Em frozen onefile, APP_ROOT aponta para sys._MEIPASS (pasta temporária
+    recriada a cada run) — não serve para persistência. Por isso usamos
+    %APPDATA%/Iris (ou ~/.iris como fallback).
+    """
+    base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+    if base:
+        return Path(base) / "Iris"
+    return Path.home() / ".iris"
+
+
 APP_ROOT   = _root()
 ASSETS_DIR = APP_ROOT / "app" / "src" / "assets"
 MODELS_DIR = APP_ROOT / "app" / "src" / "models"
 DOCS_DIR   = APP_ROOT / "docs"
+CONFIG_DIR = _config_dir()

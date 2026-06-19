@@ -145,9 +145,11 @@ desk_Iris/
         │               └── _dml_warmup.py pre-warm assíncrono do ONNX (startup)
         │
         ├── infrastructure/            ◈  adapters de hardware
-        │   └── video/
-        │       ├── camera.py          SingleCameraManager — callback thread-safe
-        │       └── enhance.py         EdgeEnhancer — filtro de bordas opcional
+        │   ├── video/
+        │   │   ├── camera.py          SingleCameraManager — callback thread-safe
+        │   │   └── enhance.py         EdgeEnhancer — filtro de bordas opcional
+        │   └── websocket/
+        │       └── server.py          QrWebSocketServer — protocolo de integração (ws://:8765)
         │
         ├── models/
         │   └── live_qr_yolo/
@@ -157,6 +159,89 @@ desk_Iris/
         │
         └── services/                  ◈  serviços externos e flags de ambiente
             └── _devmode.py            IRIS_DEVMODE — suprime writes em banco
+```
+
+<br/>
+
+<p align="center">
+  <img src="docs/divider.svg" width="100%" alt=""/>
+</p>
+
+<br/>
+
+## Protocolo de Comunicação
+
+O Iris expõe um **servidor WebSocket** (`QrWebSocketServer`) que transmite os QR codes lidos em tempo real e aceita comandos de controle. Um cliente externo (ex.: o *SyncAssistente* em C#) conecta-se como cliente e gerencia o ciclo de vida da estação.
+
+```
+Endpoint   ws://127.0.0.1:8765
+Transporte WebSocket (texto UTF-8)
+Papel      Iris = servidor   ·   cliente externo = controlador
+```
+
+### Iris → Cliente
+
+| Mensagem | Formato | Quando |
+|----------|---------|--------|
+| **QR codes** | `@fps=<float> <code1><sep><code2>…` | a cada detecção |
+| **status** | JSON `{"type":"status",…}` | push a cada 1s + resposta a `get_status` |
+| **closing** | JSON `{"type":"closing"}` | imediatamente antes de encerrar |
+| **pong** | texto `pong` | resposta a `ping` |
+
+> O separador (`<sep>`) é configurável e **persistido** entre execuções — default `#`.
+> O prefixo `@fps=` sempre precede os códigos, então um split simples no separador
+> nunca quebra o parser do cliente.
+
+### Cliente → Iris
+
+| Comando | Efeito |
+|---------|--------|
+| `start_capture` | inicia o pipeline câmera + detector |
+| `stop_capture` | para o pipeline |
+| `display_ui: True` | exibe a interface gráfica |
+| `display_ui: False` | modo headless (interface oculta) |
+| `change_separator_character: "X"` | troca o separador de QR codes (persistido) |
+| `get_status` | solicita o JSON de estado atual |
+| `ping` | health check → responde `pong` |
+
+### Exemplo de payload (JSON mockado)
+
+Estado empurrado pelo Iris (push de 1s ou resposta a `get_status`):
+
+```json
+{
+  "type": "status",
+  "capture": true,
+  "state": "live",
+  "fps": 28.6,
+  "clients": 1
+}
+```
+
+Sinal de encerramento — permite ao cliente reconectar sem esperar timeout de socket:
+
+```json
+{
+  "type": "closing"
+}
+```
+
+Leitura de QR codes (não-JSON, otimizado para streaming) — dois códigos a 30 fps com separador `#`:
+
+```
+@fps=30.0 1NB264219200349#354089675806355
+```
+
+### Exemplo de troca
+
+```
+cliente ──→  start_capture
+cliente ──→  change_separator_character: "#"
+  iris  ──→  {"type":"status","capture":true,"state":"live","fps":29.1,"clients":1}
+  iris  ──→  @fps=29.1 1NB264219200349
+cliente ──→  ping
+  iris  ──→  pong
+  iris  ──→  {"type":"closing"}        ← Iris encerrando
 ```
 
 <br/>

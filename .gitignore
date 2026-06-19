@@ -10,3 +10,6 @@ build/
 .venv
 venv/
 *.spec
+
+# Configurações locais de editor/IDE (Claude Code, etc.)
+.claude/

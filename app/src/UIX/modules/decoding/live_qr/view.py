@@ -1547,7 +1547,7 @@ class LiveQrView(QWidget):
                 self._side_panel.add_detection(text)
                 codes.append(text)
         if codes:
-            self._ws_server.send(codes)
+            self._ws_server.send(codes, fps=self._fps_smooth)
 
     # ── Renderização ──────────────────────────────────────────────────────────
 

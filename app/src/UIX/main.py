@@ -1,7 +1,11 @@
+import atexit
+import logging
 import sys
 import threading
 import time
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon
@@ -112,11 +116,24 @@ class MainWindow(QMainWindow):
         self._loading_start  = 0.0     # monotonic quando _start_init rodou
 
         # ── WebSocket server — criado aqui para sobreviver ao ciclo de vida da UI
+        # exit_on_disconnect=False: o SyncAssistente gerencia o ciclo de vida do
+        # Iris (inicia + mata via taskkill). Se o Iris se matasse a cada queda de
+        # conexão, brigaria com a reconexão do Sync → loop de morte (suicídio →
+        # relança → suicídio). Quem mata o Iris é só o Sync, explicitamente.
         self._ws_server = QrWebSocketServer(
             on_command=self._on_ws_command,
-            exit_on_disconnect=True,
+            exit_on_disconnect=False,
         )
         self._ws_server.start()
+        atexit.register(self._ws_server.broadcast_closing)  # cobre crashes e saídas não-Qt
+
+        # ── Push periódico de status (FPS real, estado, clientes) a cada 1s ───
+        # Garante que o cliente receba o FPS continuamente, mesmo sem detecção
+        # de QR e sem depender de polling do lado do cliente.
+        self._status_push_timer = QTimer(self)
+        self._status_push_timer.setInterval(1000)
+        self._status_push_timer.timeout.connect(self._push_status)
+        self._status_push_timer.start()
 
         # ── Loading screen: índice 0 (exibido por padrão pelo QStackedWidget) ─
         self._loading_widget = _build_loading_screen()
@@ -215,11 +232,33 @@ class MainWindow(QMainWindow):
 
     # ── Comando WebSocket (display_ui) ────────────────────────────────────────
 
+    def _push_status(self) -> None:
+        """Empurra status atual para os clientes WS (chamado na UI thread a cada 1s)."""
+        view = self._live_qr_view
+        self._ws_server.broadcast_status(
+            capture=view._cam_subscribed if view else False,
+            state=view._state          if view else "idle",
+            fps=view._fps_smooth       if view else 0.0,
+        )
+
     def _on_ws_command(self, name: str, value) -> None:
         """Chamado da thread asyncio — rebridgea para UI thread via sinal Qt."""
+        import json as _json
         if name == "display_ui":
             self._ui_command_sig.emit(name, bool(value))
-
+        elif name in ("start_capture", "stop_capture"):
+            self._ui_command_sig.emit(name, True)
+        elif name == "get_status":
+            ws = value
+            view = self._live_qr_view
+            payload = _json.dumps({
+                "type": "status",
+                "capture": view._cam_subscribed if view else False,
+                "state": view._state if view else "idle",
+                "fps": round(view._fps_smooth, 1) if view else 0.0,
+                "clients": len(self._ws_server._clients),
+            })
+            self._ws_server.reply(ws, payload)
     def _handle_ui_command(self, name: str, value: bool) -> None:
         """Executa na UI thread — seguro para manipular widgets."""
         if name == "display_ui":
@@ -234,6 +273,12 @@ class MainWindow(QMainWindow):
                 if self._live_qr_view is not None:
                     self._live_qr_view.disable_render()
                 self.hide()
+        elif name == "start_capture":
+            if self._live_qr_view is not None:
+                self._live_qr_view._start_capture()
+        elif name == "stop_capture":
+            if self._live_qr_view is not None:
+                self._live_qr_view._stop_capture()
 
     def _cleanup_loading(self) -> None:
         if self._loading_widget is not None:
@@ -316,6 +361,7 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentWidget(self._live_qr_view)
 
     def closeEvent(self, event) -> None:
+        self._ws_server.broadcast_closing()  # avisa clientes antes de fechar
         self._ws_server.stop()
         if self._cam:
             self._cam.stop()
@@ -323,7 +369,45 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+def _install_crash_logging() -> None:
+    """
+    Captura tracebacks de crash em %APPDATA%/Iris/crash.log — essencial no exe
+    frozen (windowed), que não tem console. Cobre:
+      • segfaults / aborts nativos (faulthandler) — ex.: D3D12/DML, OpenCV
+      • exceções Python não tratadas (sys.excepthook)
+      • exceções não tratadas em threads (threading.excepthook)
+      • exceções em slots Qt (PyQt6 roteia para sys.excepthook antes de abortar)
+    """
+    import faulthandler
+    import traceback
+    from app.src.utils.paths import CONFIG_DIR
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        f = open(CONFIG_DIR / "crash.log", "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(f)
+
+        def _hook(exc_type, exc, tb):
+            f.write("\n==== UNCAUGHT EXCEPTION ====\n")
+            traceback.print_exception(exc_type, exc, tb, file=f)
+            f.flush()
+            logger.error("Crash capturado em crash.log", exc_info=(exc_type, exc, tb))
+
+        sys.excepthook = _hook
+
+        def _thook(args):
+            f.write("\n==== UNCAUGHT THREAD EXCEPTION ====\n")
+            traceback.print_exception(
+                args.exc_type, args.exc_value, args.exc_traceback, file=f
+            )
+            f.flush()
+
+        threading.excepthook = _thook
+    except Exception as exc:
+        logger.warning("Falha ao instalar crash logging: %s", exc)
+
+
 def main():
+    _install_crash_logging()
     app = QApplication(sys.argv)
     app.setOrganizationName("Iris")
     app.setApplicationName("Iris")
